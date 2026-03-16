@@ -104,6 +104,20 @@ public sealed class GetAtlasLineageQueryHandler : IQueryHandler<GetAtlasLineageQ
 
         var maxHops = Math.Max(Math.Min(request.MaxHops, 10), 5); // at least 5 hops to traverse full chains
 
+        // Cache of entity → column names (extracted from URNs)
+        var entityColumnNamesCache = new Dictionary<string, List<string>>();
+
+        async Task<List<string>> GetEntityColumnNamesAsync(string entityUrn)
+        {
+            if (entityColumnNamesCache.TryGetValue(entityUrn, out var cached)) return cached;
+            var r = await _searchRepository.GetColumnUrnsByProcessorFqnAsync(entityUrn, cancellationToken);
+            var names = (r.IsSuccess && r.Value != null)
+                ? r.Value.Select(ExtractColumnName).Distinct().ToList()
+                : new List<string>();
+            entityColumnNamesCache[entityUrn] = names;
+            return names;
+        }
+
         for (var hop = 0; hop < maxHops && frontier.Count > 0; hop++)
         {
             var currentBatch = new List<string>();
@@ -119,33 +133,26 @@ public sealed class GetAtlasLineageQueryHandler : IQueryHandler<GetAtlasLineageQ
 
                 var myColumnUrns = columnUrnsResult.Value;
                 var myColumnUrnSet = new HashSet<string>(myColumnUrns);
+                entityColumnNamesCache[entityUrn] = myColumnUrns.Select(ExtractColumnName).Distinct().ToList();
 
                 // Get direct edges for these columns
                 var edgesResult = await _graphRepository.GetDirectColumnEdgesAsync(myColumnUrns, cancellationToken);
                 if (edgesResult.IsFailure || edgesResult.Value == null)
                     continue;
 
+                // Collect connected entity URNs from the edges
+                var connectedDownstream = new HashSet<string>();
+                var connectedUpstream = new HashSet<string>();
+
                 foreach (var (from, to) in edgesResult.Value)
                 {
                     if (myColumnUrnSet.Contains(from) && !myColumnUrnSet.Contains(to))
                     {
-                        // entityUrn column → downstream column
                         var downstreamParent = ExtractParentUrn(to);
                         if (downstreamParent != entityUrn)
                         {
+                            connectedDownstream.Add(downstreamParent);
                             allEntityUrns.Add(downstreamParent);
-                            var edgeKey = $"{entityUrn}→{downstreamParent}";
-                            if (entityEdgeSet.Add(edgeKey))
-                            {
-                                columnLineageDtos.Add(new ColumnLineageDto
-                                {
-                                    FromUrn = entityUrn,
-                                    FromColumn = ExtractColumnName(from),
-                                    ToUrn = downstreamParent,
-                                    ToColumn = ExtractColumnName(to)
-                                });
-                            }
-
                             if (!visitedEntities.Contains(downstreamParent) && (direction is LineageDirection.Downstream or LineageDirection.Both))
                             {
                                 visitedEntities.Add(downstreamParent);
@@ -155,29 +162,65 @@ public sealed class GetAtlasLineageQueryHandler : IQueryHandler<GetAtlasLineageQ
                     }
                     else if (!myColumnUrnSet.Contains(from) && myColumnUrnSet.Contains(to))
                     {
-                        // Upstream column → entityUrn column
                         var upstreamParent = ExtractParentUrn(from);
                         if (upstreamParent != entityUrn)
                         {
+                            connectedUpstream.Add(upstreamParent);
                             allEntityUrns.Add(upstreamParent);
-                            var edgeKey = $"{upstreamParent}→{entityUrn}";
-                            if (entityEdgeSet.Add(edgeKey))
-                            {
-                                columnLineageDtos.Add(new ColumnLineageDto
-                                {
-                                    FromUrn = upstreamParent,
-                                    FromColumn = ExtractColumnName(from),
-                                    ToUrn = entityUrn,
-                                    ToColumn = ExtractColumnName(to)
-                                });
-                            }
-
                             if (!visitedEntities.Contains(upstreamParent) && (direction is LineageDirection.Upstream or LineageDirection.Both))
                             {
                                 visitedEntities.Add(upstreamParent);
                                 frontier.Enqueue(upstreamParent);
                             }
                         }
+                    }
+                }
+
+                // For each connected entity pair, emit one ColumnLineageDto per shared column
+                foreach (var downstreamUrn in connectedDownstream)
+                {
+                    var edgeKey = $"{entityUrn}→{downstreamUrn}";
+                    if (!entityEdgeSet.Add(edgeKey)) continue;
+
+                    var myColNames = entityColumnNamesCache[entityUrn];
+                    var theirColNames = await GetEntityColumnNamesAsync(downstreamUrn);
+                    var sharedCols = myColNames.Intersect(theirColNames, StringComparer.OrdinalIgnoreCase).ToList();
+
+                    // Fall back to all source columns if no intersection (pass-through)
+                    if (sharedCols.Count == 0) sharedCols = myColNames;
+
+                    foreach (var col in sharedCols)
+                    {
+                        columnLineageDtos.Add(new ColumnLineageDto
+                        {
+                            FromUrn = entityUrn,
+                            FromColumn = col,
+                            ToUrn = downstreamUrn,
+                            ToColumn = col
+                        });
+                    }
+                }
+
+                foreach (var upstreamUrn in connectedUpstream)
+                {
+                    var edgeKey = $"{upstreamUrn}→{entityUrn}";
+                    if (!entityEdgeSet.Add(edgeKey)) continue;
+
+                    var myColNames = entityColumnNamesCache[entityUrn];
+                    var theirColNames = await GetEntityColumnNamesAsync(upstreamUrn);
+                    var sharedCols = theirColNames.Intersect(myColNames, StringComparer.OrdinalIgnoreCase).ToList();
+
+                    if (sharedCols.Count == 0) sharedCols = theirColNames;
+
+                    foreach (var col in sharedCols)
+                    {
+                        columnLineageDtos.Add(new ColumnLineageDto
+                        {
+                            FromUrn = upstreamUrn,
+                            FromColumn = col,
+                            ToUrn = entityUrn,
+                            ToColumn = col
+                        });
                     }
                 }
             }

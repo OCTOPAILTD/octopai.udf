@@ -344,48 +344,74 @@ export const LineageViewer = ({ assetUrn, assetName }: LineageViewerProps) => {
     
     console.log('[LineageViewer] Total datasets to render:', datasets.size);
     
+    // Topological sort for column-level view (same as dataset view)
+    const colEdges = lineageData.edges || [];
+    const colDepth = new Map<string, number>();
+    const colInDegree = new Map<string, number>();
+    datasets.forEach((_: any, u: string) => colInDegree.set(u, 0));
+    colEdges.forEach((e: any) => {
+      if (colInDegree.has(e.target)) colInDegree.set(e.target, (colInDegree.get(e.target) || 0) + 1);
+    });
+    const colQueue: string[] = [];
+    datasets.forEach((_: any, u: string) => {
+      if ((colInDegree.get(u) || 0) === 0) { colQueue.push(u); colDepth.set(u, 0); }
+    });
+    while (colQueue.length > 0) {
+      const cur = colQueue.shift()!;
+      const d = colDepth.get(cur) || 0;
+      colEdges.forEach((e: any) => {
+        if (e.source === cur && datasets.has(e.target)) {
+          const nd = d + 1;
+          if (!colDepth.has(e.target) || colDepth.get(e.target)! < nd) colDepth.set(e.target, nd);
+          colQueue.push(e.target);
+        }
+      });
+    }
+    // Assign any unvisited nodes a depth
+    datasets.forEach((_: any, u: string) => { if (!colDepth.has(u)) colDepth.set(u, 0); });
+
+    // Group by depth column, stack vertically
+    const colByDepth = new Map<number, string[]>();
+    colDepth.forEach((d, u) => {
+      if (!colByDepth.has(d)) colByDepth.set(d, []);
+      colByDepth.get(d)!.push(u);
+    });
+
+    const NODE_W = 280;
+    const NODE_H = 320; // estimated height per node (with columns)
+
     // Create dataset nodes with column information
-    let xPos = 0;
     datasets.forEach((dataset, urn) => {
       const isCenter = urn === assetUrn;
       const isFile = dataset.platform === 'file';
       
-      // Get columns for this dataset from column lineage mappings
+      // Get columns for this dataset
       const columns = new Set<string>();
-      
       if (dataset.columns && Array.isArray(dataset.columns)) {
         dataset.columns.forEach((col: string) => columns.add(col));
       }
-      
       if (columns.size === 0) {
-        const relatedColumns = lineageData.columnLineage?.filter((col: any) => 
-          col.source_dataset === urn || col.target_dataset === urn
-        ) || [];
-        relatedColumns.forEach((col: any) => {
-          if (col.source_dataset === urn && col.source_field) columns.add(col.source_field);
-          if (col.target_dataset === urn && col.target_field) columns.add(col.target_field);
+        lineageData.columnLineage?.forEach((cl: any) => {
+          if (cl.source_dataset === urn && cl.source_field) columns.add(cl.source_field);
+          if (cl.target_dataset === urn && cl.target_field) columns.add(cl.target_field);
         });
       }
-      
-      if (lineageData.nodeSchemas?.has(urn)) {
-        const nodeSchema = lineageData.nodeSchemas.get(urn);
-        nodeSchema.forEach((field: any) => {
-          if (field.fieldPath) columns.add(field.fieldPath);
-        });
-      }
-      
       if (isCenter && lineageData.schema?.fields && columns.size === 0) {
-        lineageData.schema.fields.forEach((field: any) => {
-          if (field.fieldPath) columns.add(field.fieldPath);
-        });
+        lineageData.schema.fields.forEach((field: any) => { if (field.fieldPath) columns.add(field.fieldPath); });
       }
       
-      console.log(`[LineageViewer] Dataset ${dataset.name}: ${columns.size} columns, isCenter: ${isCenter}`);
+      const depth = colDepth.get(urn) || 0;
+      const depthNodes = colByDepth.get(depth) || [];
+      const posInDepth = depthNodes.indexOf(urn);
+      const xPos = depth * (NODE_W + 70);
+      const yPos = posInDepth * (NODE_H + 30);
+
+      console.log(`[LineageViewer] Dataset ${dataset.name}: ${columns.size} columns, depth=${depth}`);
       
       nodes.push({
-        id: urnToNodeId(urn),   // Safe ID - no special chars
+        id: urnToNodeId(urn),
         type: 'columnNode',
-        position: { x: xPos, y: 150 },
+        position: { x: xPos, y: yPos },
         data: {
           label: dataset.name,
           platform: dataset.platform || 'unknown',
@@ -401,11 +427,8 @@ export const LineageViewer = ({ assetUrn, assetName }: LineageViewerProps) => {
           padding: '8px',
           width: '256px',
           maxWidth: '256px',
-          overflow: 'hidden',
         },
       });
-      
-      xPos += 350;
     });
     
     return nodes;
@@ -413,57 +436,59 @@ export const LineageViewer = ({ assetUrn, assetName }: LineageViewerProps) => {
 
   const buildColumnLevelEdges = (lineageData: any): Edge[] => {
     const edges: Edge[] = [];
-    
-    // DO NOT add dataset-level edges in column-level view - only show column-to-column arrows
-    
-    // Add column-level edges (connecting specific fields)
+    const edgeSet = new Set<string>();
+
     if (lineageData.columnLineage && lineageData.columnLineage.length > 0) {
-      console.log(`[LineageViewer] Rendering ${lineageData.columnLineage.length} field-to-field edges`);
-      console.log('[LineageViewer] Column lineage data:', lineageData.columnLineage);
-      
+      console.log(`[LineageViewer] Rendering ${lineageData.columnLineage.length} column lineage edges`);
+
       lineageData.columnLineage.forEach((col: any, index: number) => {
-        console.log(`[LineageViewer] Processing lineage ${index}:`, col);
-        
-        if (col.source_field && col.source_field !== 'N/A' && col.target_field && col.target_field !== 'N/A') {
-          // Create arrow from specific source field handle to target field handle
-          const colors = ['#3b82f6', '#2563eb', '#1d4ed8', '#1e40af'];
-          const color = colors[index % colors.length];
-          
-          const edge = {
-            id: `field-edge-${index}-${col.source_field}-to-${col.target_field}`,
-            source: urnToNodeId(col.source_dataset),
-            sourceHandle: `${col.source_field}-source`,
-            target: urnToNodeId(col.target_dataset),
-            targetHandle: `${col.target_field}-target`,
-            type: 'smoothstep',
-            animated: true,
-            style: { 
-              stroke: color, 
-              strokeWidth: 2,
-            },
-            markerEnd: { 
-              type: MarkerType.ArrowClosed, 
-              color: color,
-              width: 12,
-              height: 12
-            },
-          };
-          
-          console.log(`[LineageViewer] Created edge:`, edge);
-          edges.push(edge);
-        } else {
-          console.log(`[LineageViewer] Skipped lineage ${index} - missing fields:`, {
-            source_field: col.source_field,
-            target_field: col.target_field
-          });
-        }
+        if (!col.source_dataset || !col.target_dataset || col.source_dataset === col.target_dataset) return;
+
+        const srcId = urnToNodeId(col.source_dataset);
+        const tgtId = urnToNodeId(col.target_dataset);
+        const field = col.source_field || '';
+        const edgeKey = `${srcId}→${tgtId}→${field}`;
+        if (edgeSet.has(edgeKey)) return;
+        edgeSet.add(edgeKey);
+
+        const colors = ['#3b82f6', '#2563eb', '#1d4ed8', '#1e40af', '#60a5fa'];
+        const color = colors[index % colors.length];
+
+        edges.push({
+          id: `col-edge-${index}-${edgeKey}`,
+          source: srcId,
+          target: tgtId,
+          // Use per-column handles when field names are available
+          ...(col.source_field && col.source_field !== 'N/A' ? { sourceHandle: `${col.source_field}-source` } : {}),
+          ...(col.target_field && col.target_field !== 'N/A' ? { targetHandle: `${col.target_field}-target` } : {}),
+          type: 'smoothstep',
+          animated: true,
+          label: col.source_field && col.source_field !== 'N/A' ? col.source_field : undefined,
+          labelStyle: { fontSize: 10, fill: '#6b7280' },
+          labelBgStyle: { fill: 'white', fillOpacity: 0.8 },
+          style: { stroke: color, strokeWidth: 2 },
+          markerEnd: { type: MarkerType.ArrowClosed, color, width: 12, height: 12 },
+        } as Edge);
       });
-      
-      console.log(`[LineageViewer] Created ${edges.length} field-to-field edges`);
-    } else {
-      console.log('[LineageViewer] No column lineage data available');
+
+      console.log(`[LineageViewer] Created ${edges.length} column-level edges`);
     }
-    
+
+    // Fallback: if no column lineage, use dataset-level edges
+    if (edges.length === 0 && lineageData.edges) {
+      lineageData.edges.forEach((e: any, i: number) => {
+        edges.push({
+          id: `fallback-edge-${i}`,
+          source: urnToNodeId(e.source),
+          target: urnToNodeId(e.target),
+          type: 'smoothstep',
+          animated: true,
+          style: { stroke: '#6b7280', strokeWidth: 2 },
+          markerEnd: { type: MarkerType.ArrowClosed },
+        } as Edge);
+      });
+    }
+
     return edges;
   };
 
