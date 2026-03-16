@@ -1,0 +1,152 @@
+version: '3.8'
+
+services:
+  arangodb:
+    image: arangodb:3.11
+    container_name: nifi-metadata-arangodb
+    ports:
+      - "8529:8529"
+    environment:
+      - ARANGO_ROOT_PASSWORD=rootpassword
+      - ARANGO_NO_AUTH=1
+    volumes:
+      - arango-data:/var/lib/arangodb3
+    networks:
+      - nifi-metadata-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider --quiet http://127.0.0.1:8529/_api/version || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    container_name: nifi-metadata-opensearch
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    networks:
+      - nifi-metadata-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: nifi-metadata-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - nifi-metadata-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  csharp-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    container_name: nifi-metadata-api
+    ports:
+      - "5000:5000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:5000
+      - OpenSearch__Urls__0=http://opensearch:9200
+      - OpenSearch__IndexName=nifi-processors
+      - ArangoDB__Endpoint=http://arangodb:8529
+      - ArangoDB__Database=nifi_metadata
+      - ArangoDB__Username=root
+      - ArangoDB__Password=rootpassword
+      - Redis__ConnectionString=redis:6379
+      - GSP__Url=http://gsp.onprem.qa.octopai-corp.local/parser/gsp/dataflow
+      - GSP__Timeout=30
+    depends_on:
+      arangodb:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - nifi-metadata-network
+    restart: unless-stopped
+
+  nifi-ingestion:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.nifi-ingestion
+    container_name: nifi-metadata-ingestion
+    environment:
+      - DOTNET_ENVIRONMENT=Development
+      - NiFi__Url=http://host.docker.internal:8080
+      - NiFi__PollingIntervalSeconds=10
+      - MetadataApi__Url=http://csharp-api:5000
+    depends_on:
+      - csharp-api
+    networks:
+      - nifi-metadata-network
+    restart: unless-stopped
+
+  frontend:
+    image: node:18-alpine
+    container_name: nifi-metadata-frontend
+    working_dir: /app
+    volumes:
+      - ..:/app
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_BACKEND_URL=http://localhost:5000
+    command: sh -c "npm install && npm run dev -- --host"
+    networks:
+      - nifi-metadata-network
+    depends_on:
+      - csharp-api
+
+  spark:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.spark
+    container_name: nifi-metadata-spark
+    ports:
+      - "4040:4040"  # Spark UI
+      - "7077:7077"  # Spark Master
+      - "8080:8080"  # Spark Master Web UI
+      - "8081:8081"  # Spark Worker Web UI
+    volumes:
+      - ../spark-apps:/workspace
+      - spark-data:/tmp/spark-data
+    environment:
+      - SPARK_MASTER_HOST=spark
+      - SPARK_MASTER_PORT=7077
+    networks:
+      - nifi-metadata-network
+    command: /bin/bash -c "tail -f /dev/null"
+    restart: unless-stopped
+
+volumes:
+  arango-data:
+  opensearch-data:
+  redis-data:
+  spark-data:
+
+networks:
+  nifi-metadata-network:
+    driver: bridge

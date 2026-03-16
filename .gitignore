@@ -1,0 +1,28 @@
+# Node
+node_modules/
+dist/
+.vite/
+
+# .NET build outputs
+**/bin/
+**/obj/
+*.user
+.vs/
+
+# Logs
+*.log
+build-errors.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.local
+*.env
+
+# Docker volumes (local data)
+docker/opensearch-data/
+docker/arangodb-data/
+docker/redis-data/

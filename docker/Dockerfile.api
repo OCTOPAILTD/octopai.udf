@@ -1,0 +1,30 @@
+FROM mcr.microsoft.com/dotnet/aspnet:7.0 AS base
+WORKDIR /app
+EXPOSE 5000
+
+FROM mcr.microsoft.com/dotnet/sdk:7.0 AS build
+WORKDIR /src
+
+# Copy csproj files and restore dependencies
+COPY ["src/Presentation/NiFiMetadataPlatform.API/NiFiMetadataPlatform.API.csproj", "src/Presentation/NiFiMetadataPlatform.API/"]
+COPY ["src/Infrastructure/NiFiMetadataPlatform.Infrastructure/NiFiMetadataPlatform.Infrastructure.csproj", "src/Infrastructure/NiFiMetadataPlatform.Infrastructure/"]
+COPY ["src/Core/NiFiMetadataPlatform.Application/NiFiMetadataPlatform.Application.csproj", "src/Core/NiFiMetadataPlatform.Application/"]
+COPY ["src/Core/NiFiMetadataPlatform.Domain/NiFiMetadataPlatform.Domain.csproj", "src/Core/NiFiMetadataPlatform.Domain/"]
+COPY ["src/Shared/NiFiMetadataPlatform.Contracts/NiFiMetadataPlatform.Contracts.csproj", "src/Shared/NiFiMetadataPlatform.Contracts/"]
+
+RUN dotnet restore "src/Presentation/NiFiMetadataPlatform.API/NiFiMetadataPlatform.API.csproj"
+
+# Copy all source files
+COPY . .
+
+# Build the project
+WORKDIR "/src/src/Presentation/NiFiMetadataPlatform.API"
+RUN dotnet build "NiFiMetadataPlatform.API.csproj" -c Release -o /app/build
+
+FROM build AS publish
+RUN dotnet publish "NiFiMetadataPlatform.API.csproj" -c Release -o /app/publish /p:UseAppHost=false
+
+FROM base AS final
+WORKDIR /app
+COPY --from=publish /app/publish .
+ENTRYPOINT ["dotnet", "NiFiMetadataPlatform.API.dll"]
