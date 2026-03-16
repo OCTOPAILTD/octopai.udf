@@ -12,6 +12,8 @@ import {
   Loader2,
   FolderTree,
   Server,
+  Table2,
+  Layers,
 } from 'lucide-react';
 import config from '../config';
 
@@ -43,11 +45,14 @@ const UDFCatalogSearchV2 = () => {
 
   const entityTypes = [
     { value: 'DATASET', label: 'Dataset', icon: Database },
+    { value: 'TABLE', label: 'Table', icon: Table2 },
     { value: 'DATA_FLOW', label: 'Data Flow', icon: GitBranch },
     { value: 'DATA_JOB', label: 'Data Job', icon: FileText },
+    { value: 'DATABASE', label: 'Database', icon: Server },
+    { value: 'SCHEMA', label: 'Schema', icon: Layers },
   ];
 
-  const platforms = ['NiFi', 'File', 'Kafka', 'Hive', 'Spark'];
+  const platforms = ['NiFi', 'MSSQL', 'Snowflake', 'File', 'Kafka', 'Hive', 'Spark'];
 
   useEffect(() => {
     const q = searchParams.get('q');
@@ -210,27 +215,43 @@ const UDFCatalogSearchV2 = () => {
 
   const getEntityIcon = (type: string, urn?: string) => {
     const typeUpper = type.toUpperCase();
-    if (typeUpper === 'CONTAINER') {
-      // Distinguish between NiFi instance and process group
-      if (urn?.includes('nifi-instance-')) {
-        return Server;
-      }
-      return FolderTree;
-    }
+    if (typeUpper === 'CONTAINER') return urn?.includes('nifi-instance-') ? Server : FolderTree;
+    if (typeUpper === 'TABLE') return Table2;
+    if (typeUpper === 'DATABASE') return Server;
+    if (typeUpper === 'SCHEMA') return Layers;
     const entityType = entityTypes.find(t => t.value === typeUpper);
     return entityType?.icon || Database;
+  };
+
+  const getPlatformBadgeClass = (platform: string) => {
+    switch (platform?.toLowerCase()) {
+      case 'mssql': return 'bg-red-100 text-red-700';
+      case 'snowflake': return 'bg-blue-100 text-blue-700';
+      case 'nifi': return 'bg-orange-100 text-orange-700';
+      default: return 'bg-gray-100 text-gray-700';
+    }
+  };
+
+  const getHierarchyBreadcrumb = (urn: string): string[] => {
+    // jdbc://server/database/schema/table → [server, database, schema, table]
+    if (urn.startsWith('jdbc://')) {
+      const parts = urn.replace('jdbc://', '').split('/').filter(Boolean);
+      return parts;
+    }
+    return [];
   };
 
   const hasActiveFilters = selectedType || selectedPlatform;
 
   // TreeNode component for hierarchical display
   const TreeNode = ({ node, onNavigate }: { node: SearchResult; onNavigate: (urn: string) => void }) => {
-    // Auto-expand root and first-level items
     const [isExpanded, setIsExpanded] = useState((node.level || 0) <= 1);
     const hasChildren = node.children && node.children.length > 0;
     const Icon = getEntityIcon(node.type, node.urn);
     const level = node.level || 0;
-    
+    const isTable = node.type?.toUpperCase() === 'TABLE';
+    const breadcrumb = isTable ? getHierarchyBreadcrumb(node.urn) : [];
+
     const handleClick = (e: React.MouseEvent) => {
       if (hasChildren) {
         e.stopPropagation();
@@ -239,60 +260,67 @@ const UDFCatalogSearchV2 = () => {
         onNavigate(node.urn);
       }
     };
-    
+
     return (
       <div>
         <button
           onClick={handleClick}
-          className={`w-full bg-white rounded-lg border border-gray-200 p-6 hover:shadow-md hover:border-cloudera-blue transition-all text-left ${
-            level > 0 ? 'ml-' + (level * 8) : ''
-          }`}
+          className="w-full bg-white rounded-lg border border-gray-200 p-5 hover:shadow-md hover:border-blue-400 transition-all text-left"
           style={{ marginLeft: level > 0 ? `${level * 2}rem` : '0' }}
         >
           <div className="flex items-start gap-4">
-            {hasChildren && (
-              <div className="flex-shrink-0 w-6 h-6 flex items-center justify-center">
-                <ChevronRight 
-                  className={`w-5 h-5 text-gray-400 transform transition-transform ${
-                    isExpanded ? 'rotate-90' : ''
-                  }`}
-                />
+            {hasChildren ? (
+              <div className="flex-shrink-0 w-6 h-6 flex items-center justify-center mt-1">
+                <ChevronRight className={`w-5 h-5 text-gray-400 transform transition-transform ${isExpanded ? 'rotate-90' : ''}`} />
               </div>
+            ) : (
+              <div className="w-6 flex-shrink-0" />
             )}
-            <div className={`w-12 h-12 bg-blue-50 rounded-lg flex items-center justify-center flex-shrink-0 ${!hasChildren ? 'ml-8' : ''}`}>
-              <Icon className="w-6 h-6 text-cloudera-blue" />
+            <div className={`w-10 h-10 rounded-lg flex items-center justify-center flex-shrink-0 ${isTable ? 'bg-purple-50' : 'bg-blue-50'}`}>
+              <Icon className={`w-5 h-5 ${isTable ? 'text-purple-600' : 'text-blue-600'}`} />
             </div>
             <div className="flex-1 min-w-0">
-              <h3 className="font-semibold text-gray-900 mb-2 text-lg">
-                {node.name}
-              </h3>
-              <div className="flex items-center gap-2 mb-2">
-                <span className="inline-block px-2 py-0.5 bg-blue-100 text-blue-700 text-xs font-medium rounded">
+              <div className="flex items-center gap-2 flex-wrap mb-1">
+                <h3 className="font-semibold text-gray-900 text-base">{node.name}</h3>
+                <span className={`px-2 py-0.5 text-xs font-medium rounded ${isTable ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'}`}>
                   {node.type}
                 </span>
                 {node.platform && (
-                  <span className="inline-block px-2 py-0.5 bg-gray-100 text-gray-700 text-xs font-medium rounded">
+                  <span className={`px-2 py-0.5 text-xs font-medium rounded ${getPlatformBadgeClass(node.platform)}`}>
                     {node.platform}
                   </span>
                 )}
                 {hasChildren && (
-                  <span className="inline-block px-2 py-0.5 bg-green-100 text-green-700 text-xs font-medium rounded">
+                  <span className="px-2 py-0.5 bg-green-100 text-green-700 text-xs font-medium rounded">
                     {node.children!.length} item{node.children!.length !== 1 ? 's' : ''}
                   </span>
                 )}
               </div>
-              {node.description && (
-                <p className="text-sm text-gray-600 line-clamp-2">
-                  {node.description}
-                </p>
+              {/* Hierarchy breadcrumb for TABLE entities */}
+              {breadcrumb.length > 1 && (
+                <div className="flex items-center gap-1 text-xs text-gray-500 mb-1">
+                  {breadcrumb.slice(0, -1).map((part, i) => (
+                    <span key={i} className="flex items-center gap-1">
+                      {i > 0 && <span className="text-gray-300">/</span>}
+                      <span>{part}</span>
+                    </span>
+                  ))}
+                  <span className="text-gray-300">/</span>
+                  <span className="font-medium text-gray-700">{breadcrumb[breadcrumb.length - 1]}</span>
+                </div>
               )}
-              <p className="text-xs text-gray-400 mt-2 font-mono truncate">
-                {node.urn}
-              </p>
+              {node.description && (
+                <p className="text-sm text-gray-500 line-clamp-1">{node.description}</p>
+              )}
+              <p className="text-xs text-gray-300 mt-1 font-mono truncate">{node.urn}</p>
             </div>
+            {/* Navigate arrow for leaf nodes */}
+            {!hasChildren && (
+              <ChevronRight className="w-5 h-5 text-gray-300 flex-shrink-0 mt-2" />
+            )}
           </div>
         </button>
-        
+
         {isExpanded && hasChildren && (
           <div className="mt-2 space-y-2">
             {node.children!.map((child) => (

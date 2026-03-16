@@ -2,7 +2,6 @@ using Microsoft.Extensions.Logging;
 using NiFiMetadataPlatform.Application.Common;
 using NiFiMetadataPlatform.Application.DTOs;
 using NiFiMetadataPlatform.Application.Interfaces;
-using NiFiMetadataPlatform.Domain.Entities;
 
 namespace NiFiMetadataPlatform.Application.Queries.Handlers;
 
@@ -33,7 +32,7 @@ public sealed class SearchEntitiesQueryHandler : IQueryHandler<SearchEntitiesQue
             request.Platform,
             request.Count);
 
-        var result = await _searchRepository.SearchWithFiltersAsync(
+        var result = await _searchRepository.SearchAllEntitiesAsync(
             request.Query,
             request.TypeName,
             request.Platform,
@@ -46,16 +45,17 @@ public sealed class SearchEntitiesQueryHandler : IQueryHandler<SearchEntitiesQue
             return Result<AtlasSearchResponse>.Failure(result.Error!);
         }
 
-        var (processors, total) = result.Value;
-
-        // Map processors to DTOs
-        var processorDtos = processors.Select(MapToAtlasEntity).ToList();
+        var (entities, total) = result.Value;
 
         // For NiFi platform, build hierarchy by adding synthetic container and process group entities
-        var allResults = processorDtos;
+        var allResults = entities;
         if (request.Platform?.Equals("NiFi", StringComparison.OrdinalIgnoreCase) == true)
         {
-            allResults = BuildHierarchyWithContainers(processorDtos);
+            // Extract NiFi processors to build hierarchy
+            var processorEntities = entities.Where(e => e.Urn.StartsWith("nifi://")).ToList();
+            allResults = BuildHierarchyWithContainers(processorEntities);
+            // Add non-NiFi entities back (tables, etc.)
+            allResults.AddRange(entities.Where(e => !e.Urn.StartsWith("nifi://")));
         }
 
         var response = new AtlasSearchResponse
@@ -68,20 +68,6 @@ public sealed class SearchEntitiesQueryHandler : IQueryHandler<SearchEntitiesQue
         _logger.LogInformation("Search returned {Count} results out of {Total}", response.Count, response.Total);
 
         return Result<AtlasSearchResponse>.Success(response);
-    }
-
-    private static AtlasEntityDto MapToAtlasEntity(NiFiProcessor processor)
-    {
-        return new AtlasEntityDto
-        {
-            Urn = processor.Fqn.Value,
-            Type = "DATASET",
-            Name = processor.Name.Value,
-            Platform = "NiFi",
-            Description = processor.Description ?? string.Empty,
-            Properties = processor.Properties.ToDictionary(),
-            ParentContainerUrn = processor.ParentProcessGroupId.Value
-        };
     }
 
     private static List<AtlasEntityDto> BuildHierarchyWithContainers(List<AtlasEntityDto> processors)

@@ -242,6 +242,23 @@ const UDFEntityPage = () => {
                 )}
               </div>
 
+              {/* Hierarchy breadcrumb for TABLE entities */}
+              {entity.type === 'TABLE' && entity.properties && (
+                <div className="flex items-center gap-1 text-sm text-gray-500 mb-3">
+                  {[
+                    entity.properties.server,
+                    entity.properties.database,
+                    entity.properties.schema,
+                    entity.name,
+                  ].filter(Boolean).map((part, i, arr) => (
+                    <span key={i} className="flex items-center gap-1">
+                      {i > 0 && <span className="text-gray-300 mx-1">/</span>}
+                      <span className={i === arr.length - 1 ? 'font-semibold text-gray-800' : ''}>{part}</span>
+                    </span>
+                  ))}
+                </div>
+              )}
+
               {entity.description && (
                 <p className="text-gray-600 mb-4">{entity.description}</p>
               )}

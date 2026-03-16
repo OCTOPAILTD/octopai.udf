@@ -181,4 +181,20 @@ public interface ISearchRepository
     Task<Result<List<ColumnInfoDto>>> GetColumnsByTableFqnAsync(
         string tableFqn,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Searches all entity types (processors, tables, columns, schemas) returning AtlasEntityDto directly.
+    /// </summary>
+    /// <param name="query">The search query.</param>
+    /// <param name="typeName">Optional type filter (e.g. "TABLE", "COLUMN").</param>
+    /// <param name="platform">Optional platform filter (e.g. "NiFi", "MSSQL", "Snowflake").</param>
+    /// <param name="count">Maximum number of results.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>A tuple with matching entities and total count.</returns>
+    Task<Result<(List<AtlasEntityDto> Entities, int Total)>> SearchAllEntitiesAsync(
+        string query,
+        string? typeName,
+        string? platform,
+        int count,
+        CancellationToken cancellationToken = default);
 }

@@ -425,6 +425,99 @@ public sealed class OpenSearchRepository : ISearchRepository
     }
 
     /// <inheritdoc/>
+    public async Task<Domain.Common.Result<(List<Application.DTOs.AtlasEntityDto> Entities, int Total)>> SearchAllEntitiesAsync(
+        string query,
+        string? typeName,
+        string? platform,
+        int count,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var searchQuery = query == "*" || string.IsNullOrWhiteSpace(query) ? "*" : query;
+            var mustQueries = new List<QueryContainer>();
+
+            if (searchQuery != "*")
+            {
+                mustQueries.Add(new MultiMatchQuery
+                {
+                    Query = searchQuery,
+                    Fields = new[] { "name^3", "type", "description", "fqn" }
+                });
+            }
+            else
+            {
+                mustQueries.Add(new MatchAllQuery());
+            }
+
+            var filterQueries = new List<QueryContainer>();
+
+            if (!string.IsNullOrWhiteSpace(platform))
+            {
+                filterQueries.Add(new TermQuery { Field = "platform.keyword", Value = platform });
+            }
+
+            if (!string.IsNullOrWhiteSpace(typeName))
+            {
+                filterQueries.Add(new TermQuery { Field = "type.keyword", Value = typeName });
+            }
+
+            // Exclude raw column entries from general search (too noisy)
+            if (string.IsNullOrWhiteSpace(typeName))
+            {
+                filterQueries.Add(new BoolQuery
+                {
+                    MustNot = new List<QueryContainer>
+                    {
+                        new TermQuery { Field = "type.keyword", Value = "COLUMN" }
+                    }
+                });
+            }
+
+            var searchRequest = new SearchRequest(_settings.IndexName)
+            {
+                Query = new BoolQuery { Must = mustQueries, Filter = filterQueries },
+                Size = count,
+                Sort = new List<ISort>
+                {
+                    new FieldSort { Field = "_score", Order = SortOrder.Descending },
+                    new FieldSort { Field = "name.keyword", Order = SortOrder.Ascending }
+                }
+            };
+
+            var response = await _client.SearchAsync<ProcessorDocument>(searchRequest, cancellationToken);
+
+            if (!response.IsValid)
+            {
+                return Domain.Common.Result<(List<Application.DTOs.AtlasEntityDto>, int)>.Failure(
+                    $"Search failed: {response.OriginalException?.Message}");
+            }
+
+            var entities = response.Documents
+                .Where(doc => doc.Fqn != null)
+                .Select(doc => new Application.DTOs.AtlasEntityDto
+                {
+                    Urn = doc.Fqn,
+                    Type = doc.Type ?? "DATASET",
+                    Name = doc.Name ?? doc.Fqn.Split('/').LastOrDefault() ?? doc.Fqn,
+                    Platform = doc.Platform ?? "Unknown",
+                    Description = doc.Description ?? string.Empty,
+                    Properties = doc.Properties ?? new Dictionary<string, string>(),
+                    ParentContainerUrn = doc.ParentProcessGroupId
+                })
+                .ToList();
+
+            var total = (int)(response.Total > int.MaxValue ? int.MaxValue : response.Total);
+            return Domain.Common.Result<(List<Application.DTOs.AtlasEntityDto>, int)>.Success((entities, total));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error in SearchAllEntitiesAsync");
+            return Domain.Common.Result<(List<Application.DTOs.AtlasEntityDto>, int)>.Failure($"Search failed: {ex.Message}");
+        }
+    }
+
+    /// <inheritdoc/>
     public async Task<Domain.Common.Result<List<NiFiProcessor>>> GetHierarchyAsync(
         CancellationToken cancellationToken = default)
     {
