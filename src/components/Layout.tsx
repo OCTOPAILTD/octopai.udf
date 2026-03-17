@@ -38,7 +38,6 @@ const Layout = ({ children }: LayoutProps) => {
   const navItems: NavItem[] = [
     { id: 'home', label: 'Home', icon: Home, path: '/home' },
     { id: 'workspaces', label: 'Workspaces', icon: LayoutGrid, path: '/workspaces' },
-    { id: 'catalog', label: 'Data catalog', icon: Database, path: '/catalog' },
     { id: 'udf-catalog', label: 'UDF Catalog', icon: Database, path: '/udf-catalog' },
     { id: 'monitor', label: 'Monitor', icon: Monitor, path: '/monitor' },
     { id: 'realtime', label: 'Real-Time', icon: Zap, path: '/realtime' },

@@ -47,35 +47,126 @@ public sealed class GetAtlasLineageQueryHandler : IQueryHandler<GetAtlasLineageQ
     }
 
     /// <summary>
-    /// For a column URN: return all connected column URNs as column entities.
+    /// For a column URN: BFS-traverse the column lineage graph and return
+    /// parent-entity nodes with ColumnLineageDto edges (entity-to-entity, column-annotated).
+    /// This produces the same diagram shape as processor lineage but filtered to one column.
     /// </summary>
     private async Task<Result<AtlasLineageResponse>> HandleColumnLineageAsync(
         GetAtlasLineageQuery request,
         CancellationToken cancellationToken)
     {
         var direction = ParseDirection(request.Direction);
-        var upstreamUrns = new List<string>();
-        var downstreamUrns = new List<string>();
+        var columnName = ExtractColumnName(request.Urn);
+        var centerEntityUrn = ExtractParentUrn(request.Urn);
 
-        if (direction is LineageDirection.Upstream or LineageDirection.Both)
+        // BFS over column edges to collect all column URNs in the chain
+        var visitedColumnUrns = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { request.Urn };
+        var frontier = new Queue<string>();
+        frontier.Enqueue(request.Urn);
+
+        // All directed edges between column URNs
+        var columnEdges = new List<(string From, string To)>();
+
+        var maxHops = Math.Max(Math.Min(request.MaxHops, 10), 8);
+
+        for (var hop = 0; hop < maxHops && frontier.Count > 0; hop++)
         {
-            var result = await _graphRepository.TraverseColumnLineageAsync(
-                request.Urn, request.MaxHops, LineageDirection.Upstream, cancellationToken);
-            if (result.IsSuccess) upstreamUrns = result.Value!;
+            var batch = new List<string>();
+            while (frontier.Count > 0) batch.Add(frontier.Dequeue());
+
+            var edgesResult = await _graphRepository.GetDirectColumnEdgesAsync(batch, cancellationToken);
+            if (edgesResult.IsFailure || edgesResult.Value == null) continue;
+
+            foreach (var (from, to) in edgesResult.Value)
+            {
+                columnEdges.Add((from, to));
+
+                if (direction is LineageDirection.Downstream or LineageDirection.Both)
+                {
+                    if (batch.Contains(from) && !visitedColumnUrns.Contains(to))
+                    {
+                        visitedColumnUrns.Add(to);
+                        frontier.Enqueue(to);
+                    }
+                }
+
+                if (direction is LineageDirection.Upstream or LineageDirection.Both)
+                {
+                    if (batch.Contains(to) && !visitedColumnUrns.Contains(from))
+                    {
+                        visitedColumnUrns.Add(from);
+                        frontier.Enqueue(from);
+                    }
+                }
+            }
         }
 
-        if (direction is LineageDirection.Downstream or LineageDirection.Both)
+        // Build entity-level ColumnLineageDtos from column edges
+        var columnLineageDtos = new List<ColumnLineageDto>();
+        var edgeSet = new HashSet<string>();
+
+        foreach (var (fromColUrn, toColUrn) in columnEdges)
         {
-            var result = await _graphRepository.TraverseColumnLineageAsync(
-                request.Urn, request.MaxHops, LineageDirection.Downstream, cancellationToken);
-            if (result.IsSuccess) downstreamUrns = result.Value!;
+            var fromEntityUrn = ExtractParentUrn(fromColUrn);
+            var toEntityUrn = ExtractParentUrn(toColUrn);
+            if (fromEntityUrn == toEntityUrn) continue;
+
+            var edgeKey = $"{fromEntityUrn}→{toEntityUrn}";
+            if (!edgeSet.Add(edgeKey)) continue;
+
+            columnLineageDtos.Add(new ColumnLineageDto
+            {
+                FromUrn = fromEntityUrn,
+                FromColumn = ExtractColumnName(fromColUrn),
+                ToUrn = toEntityUrn,
+                ToColumn = ExtractColumnName(toColUrn),
+            });
         }
+
+        // Determine upstream vs downstream entity URNs relative to the center entity
+        var upstreamEntityUrns = new HashSet<string>();
+        var downstreamEntityUrns = new HashSet<string>();
+
+        foreach (var dto in columnLineageDtos)
+        {
+            if (dto.ToUrn == centerEntityUrn) upstreamEntityUrns.Add(dto.FromUrn);
+            else if (dto.FromUrn == centerEntityUrn) downstreamEntityUrns.Add(dto.ToUrn);
+            else
+            {
+                // Determine side by checking if center is reachable upstream or downstream
+                downstreamEntityUrns.Add(dto.ToUrn);
+                upstreamEntityUrns.Add(dto.FromUrn);
+            }
+        }
+
+        // Remove center entity from up/downstream sets
+        upstreamEntityUrns.Remove(centerEntityUrn);
+        downstreamEntityUrns.Remove(centerEntityUrn);
+
+        // Enrich entity URNs with metadata from OpenSearch
+        async Task<AtlasEntityDto> EnrichEntityAsync(string entityUrn)
+        {
+            var r = await _searchRepository.GetRawEntityByFqnAsync(entityUrn, cancellationToken);
+            if (r.IsSuccess && r.Value != null)
+            {
+                return r.Value;
+            }
+
+            return CreateEntityFromUrn(entityUrn);
+        }
+
+        var upstreamEntities = await Task.WhenAll(upstreamEntityUrns.Select(EnrichEntityAsync));
+        var downstreamEntities = await Task.WhenAll(downstreamEntityUrns.Select(EnrichEntityAsync));
+
+        _logger.LogInformation(
+            "Column lineage for {Column}: {UpCount} upstream entities, {DownCount} downstream entities, {EdgeCount} edges",
+            columnName, upstreamEntities.Length, downstreamEntities.Length, columnLineageDtos.Count);
 
         return Result<AtlasLineageResponse>.Success(new AtlasLineageResponse
         {
-            Upstream = upstreamUrns.Select(CreateColumnEntity).ToList(),
-            Downstream = downstreamUrns.Select(CreateColumnEntity).ToList(),
-            ColumnLineage = new List<ColumnLineageDto>()
+            Upstream = upstreamEntities.ToList(),
+            Downstream = downstreamEntities.ToList(),
+            ColumnLineage = columnLineageDtos,
         });
     }
 

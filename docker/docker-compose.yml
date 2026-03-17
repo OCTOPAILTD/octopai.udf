@@ -29,7 +29,7 @@ services:
     environment:
       - discovery.type=single-node
       - DISABLE_SECURITY_PLUGIN=true
-      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
     volumes:
       - opensearch-data:/usr/share/opensearch/data
     networks:
@@ -140,6 +140,7 @@ services:
       - nifi-metadata-network
     command: /bin/bash -c "tail -f /dev/null"
     restart: unless-stopped
+
 
 volumes:
   arango-data:

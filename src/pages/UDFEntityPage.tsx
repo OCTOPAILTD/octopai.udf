@@ -386,8 +386,8 @@ const UDFEntityPage = () => {
               </p>
             </div>
 
-            {/* Database / Table Info for TABLE and COLUMN entities */}
-            {(entity.type === 'TABLE' || entity.type === 'COLUMN') && (
+            {/* Database / Table Info for TABLE entities */}
+            {entity.type === 'TABLE' && (
               <div className="bg-white rounded-lg border border-gray-200 p-6">
                 <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
                   <Database className="w-5 h-5 text-gray-600" />
@@ -399,15 +399,60 @@ const UDFEntityPage = () => {
                     { label: 'Server', value: entity.properties?.server },
                     { label: 'Database', value: entity.properties?.database },
                     { label: 'Schema', value: entity.properties?.schema },
-                    ...(entity.type === 'TABLE' ? [{ label: 'Table', value: entity.name }] : []),
-                    ...(entity.type === 'COLUMN' ? [
-                      { label: 'Table', value: entity.properties?.tableName || entity.properties?.parentFqn?.split('/').pop() },
-                      { label: 'Data Type', value: entity.properties?.dataType },
-                    ] : []),
+                    { label: 'Table', value: entity.name },
                   ].filter(item => item.value).map((item, idx) => (
                     <div key={idx} className="bg-gray-50 rounded-lg p-3">
                       <div className="text-xs text-gray-500 uppercase tracking-wider mb-1">{item.label}</div>
                       <div className="font-medium text-gray-900 text-sm">{item.value}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Column Properties — rich card for COLUMN entities */}
+            {entity.type === 'COLUMN' && (
+              <div className="bg-white rounded-lg border border-gray-200 p-6">
+                <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                  <Database className="w-5 h-5 text-purple-600" />
+                  Column Properties
+                </h2>
+                {/* Hierarchy breadcrumb */}
+                {(entity.properties?.server || entity.properties?.database) && (
+                  <div className="flex items-center gap-1 text-sm text-gray-500 mb-5 flex-wrap">
+                    {[
+                      entity.properties?.server,
+                      entity.properties?.database,
+                      entity.properties?.schema,
+                      entity.properties?.table,
+                      entity.name,
+                    ].filter(Boolean).map((part, i) => (
+                      <span key={i} className="flex items-center gap-1">
+                        {i > 0 && <span className="text-gray-300 mx-1">/</span>}
+                        <span className={i === 4 ? 'font-semibold text-purple-700' : ''}>{part}</span>
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                  {[
+                    { label: 'Provider', value: entity.platform },
+                    { label: 'Server', value: entity.properties?.server },
+                    { label: 'Database', value: entity.properties?.database },
+                    { label: 'Schema', value: entity.properties?.schema },
+                    { label: 'Table', value: entity.properties?.table },
+                    { label: 'Column', value: entity.name },
+                    { label: 'Data Type', value: entity.properties?.dataType },
+                    { label: 'Nullable', value: entity.properties?.nullable },
+                    { label: 'Primary Key', value: entity.properties?.primaryKey },
+                    { label: 'Ordinal Position', value: entity.properties?.ordinalPosition },
+                    ...(entity.properties?.precision ? [{ label: 'Precision', value: entity.properties.precision }] : []),
+                    ...(entity.properties?.scale ? [{ label: 'Scale', value: entity.properties.scale }] : []),
+                    ...(entity.properties?.nativeType ? [{ label: 'Native Type', value: entity.properties.nativeType }] : []),
+                  ].filter(item => item.value).map((item, idx) => (
+                    <div key={idx} className={`rounded-lg p-3 ${item.label === 'Column' ? 'bg-purple-50 border border-purple-100' : 'bg-gray-50'}`}>
+                      <div className="text-xs text-gray-500 uppercase tracking-wider mb-1">{item.label}</div>
+                      <div className={`font-medium text-sm ${item.label === 'Column' ? 'text-purple-800' : 'text-gray-900'}`}>{item.value}</div>
                     </div>
                   ))}
                 </div>
@@ -602,11 +647,69 @@ const UDFEntityPage = () => {
 
         {activeTab === 'properties' && (
           <div className="bg-white rounded-lg border border-gray-200 p-6">
-            <h2 className="text-lg font-semibold mb-4">Custom Properties</h2>
+            <h2 className="text-lg font-semibold mb-4">
+              {entity.type === 'COLUMN' ? 'Column Properties' : 'Custom Properties'}
+            </h2>
+
+            {/* For COLUMN entities: show a structured property table */}
+            {entity.type === 'COLUMN' && (
+              <div className="overflow-hidden rounded-lg border border-gray-200 mb-6">
+                <table className="w-full text-sm">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-1/3">Property</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Value</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {[
+                      { key: 'Column Name', value: entity.name },
+                      { key: 'Platform', value: entity.platform },
+                      { key: 'Server', value: entity.properties?.server },
+                      { key: 'Database', value: entity.properties?.database },
+                      { key: 'Schema', value: entity.properties?.schema },
+                      { key: 'Table', value: entity.properties?.table },
+                      { key: 'Data Type', value: entity.properties?.dataType },
+                      { key: 'Native Type', value: entity.properties?.nativeType },
+                      { key: 'Nullable', value: entity.properties?.nullable },
+                      { key: 'Primary Key', value: entity.properties?.primaryKey },
+                      { key: 'Ordinal Position', value: entity.properties?.ordinalPosition },
+                      { key: 'Precision', value: entity.properties?.precision },
+                      { key: 'Scale', value: entity.properties?.scale },
+                      { key: 'Parent FQN', value: entity.properties?.parentFqn },
+                    ].filter(row => row.value).map((row, idx) => (
+                      <tr key={idx} className="hover:bg-gray-50">
+                        <td className="px-4 py-3 font-medium text-gray-600">{row.key}</td>
+                        <td className="px-4 py-3 text-gray-900">
+                          {row.key === 'Data Type' || row.key === 'Native Type' ? (
+                            <code className="px-2 py-0.5 bg-blue-50 text-blue-700 rounded text-xs font-mono">{row.value}</code>
+                          ) : row.key === 'Primary Key' || row.key === 'Nullable' ? (
+                            <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                              row.value === 'Yes' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'
+                            }`}>{row.value}</span>
+                          ) : row.key === 'Parent FQN' ? (
+                            <code className="text-xs text-gray-500 font-mono break-all">{row.value}</code>
+                          ) : (
+                            <span>{row.value}</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
             {entity.properties && Object.keys(entity.properties).length > 0 ? (
               <div className="space-y-3">
                 {Object.entries(entity.properties)
                   .filter(([key, value]) => {
+                    // For COLUMN entities, skip keys already shown in the structured table above
+                    if (entity.type === 'COLUMN') {
+                      const columnKeys = ['server', 'database', 'schema', 'table', 'dataType', 'nativeType',
+                        'nullable', 'primaryKey', 'ordinalPosition', 'precision', 'scale', 'parentFqn', 'description'];
+                      if (columnKeys.includes(key)) return false;
+                    }
                     // Skip these known complex object keys
                     const skipKeys = [
                       'columns', 'processGroup', 'parentProcessGroup', 'parentContainer',

@@ -609,7 +609,7 @@ const WorkspaceCanvas = () => {
                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">
                       Container ID
                     </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wider w-80">
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">
                       Actions
                     </th>
                   </tr>
@@ -678,110 +678,64 @@ const WorkspaceCanvas = () => {
                       <td className="px-6 py-4">
                         <span className="text-xs text-gray-500 font-mono">{item.id.substring(0, 12)}</span>
                       </td>
-                      <td className="px-6 py-4 w-80">
-                        <div className="flex items-center gap-2 justify-end">
-                          {/* Simple Open NiFi button */}
-                          {item.name.includes('nifi') && (item.status === 'running' || item.status?.includes('Up')) && (
-                            <a
-                              href="http://localhost:8080/nifi/"
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              onClick={(e) => e.stopPropagation()}
-                              className="flex items-center gap-1 px-3 py-1 text-sm text-cloudera-blue hover:bg-blue-50 rounded"
-                            >
-                              <ExternalLink className="w-4 h-4" />
-                              Open NiFi
-                            </a>
-                          )}
-                          
-                          {/* Open Hue SQL Editor button */}
-                          {item.name.includes('hue') && item.status === 'running' && (
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                navigate(`/tool/hue/${item.id}`);
-                              }}
-                              className="flex items-center gap-1 px-3 py-1 text-sm text-green-600 hover:bg-green-50 rounded"
-                            >
-                              <ScrollText className="w-4 h-4" />
-                              Open SQL Editor
-                            </button>
-                          )}
-                          
-                          {/* Open In Octopai button - only for NiFi containers */}
-                          {item.name.includes('nifi') && (item.status === 'running' || item.status?.includes('Up')) && (
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                try {
-                                  // Go directly to the root ProcessGroup "NiFi Flow" instead of the top-level container
-                                  // This shows the actual processors instead of an empty "Contents" tab
-                                  // The backend creates the ProcessGroup with ID "root" for the root process group
-                                  const processGroupUrn = `urn:li:container:nifi-pg-${item.id}-root`;
-                                  window.open(`http://localhost:9002/container/${encodeURIComponent(processGroupUrn)}/Contents?is_lineage_mode=false`, '_blank');
-                                } catch (error) {
-                                  console.error('Failed to open DataHub:', error);
-                                  const searchQuery = encodeURIComponent(item.id.substring(0, 12));
-                                  window.open(`http://localhost:9002/search?filter_platform___false___EQUAL___0=nifi&query=${searchQuery}`, '_blank');
-                                }
-                              }}
-                              className="flex items-center gap-1 px-3 py-1 text-sm bg-cloudera-blue text-white hover:bg-blue-700 rounded"
-                            >
-                              <GitGraph className="w-4 h-4" />
-                              Open In Octopai
-                            </button>
-                          )}
-                          
-                          {/* Open In UDF button - only for NiFi containers */}
+                      <td className="px-6 py-4">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          {/* Open in UDF — primary green CTA for NiFi */}
                           {item.name.includes('nifi') && (item.status === 'running' || item.status?.includes('Up')) && (
                             <button
                               onClick={(e) => {
                                 e.stopPropagation();
                                 navigate('/udf-catalog/search?platform=NiFi');
                               }}
-                              className="flex items-center gap-1 px-3 py-1 text-sm bg-green-600 text-white hover:bg-green-700 rounded"
+                              className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium bg-green-600 text-white hover:bg-green-700 rounded-md shadow-sm"
                             >
                               <Database className="w-4 h-4" />
                               Open in UDF
                             </button>
                           )}
-                          
-                          {/* Open In Octopai button - only for Trino containers */}
-                          {item.name.includes('trino') && item.status === 'running' && (
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                try {
-                                  // Trino container URN follows the pattern: urn:li:container:{container_id}
-                                  const trinoContainerUrn = `urn:li:container:${item.id}`;
-                                  window.open(`http://localhost:9002/container/${encodeURIComponent(trinoContainerUrn)}/Contents?is_lineage_mode=false`, '_blank');
-                                } catch (error) {
-                                  console.error('Failed to open DataHub:', error);
-                                  const searchQuery = encodeURIComponent(item.id.substring(0, 12));
-                                  window.open(`http://localhost:9002/search?filter_platform___false___EQUAL___0=trino&query=${searchQuery}`, '_blank');
-                                }
-                              }}
-                              className="flex items-center gap-1 px-3 py-1 text-sm bg-cloudera-blue text-white hover:bg-blue-700 rounded"
+
+                          {/* Open NiFi */}
+                          {item.name.includes('nifi') && (item.status === 'running' || item.status?.includes('Up')) && (
+                            <a
+                              href="http://localhost:8080/nifi/"
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={(e) => e.stopPropagation()}
+                              className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium border border-blue-300 text-blue-600 hover:bg-blue-50 rounded-md"
                             >
-                              <GitGraph className="w-4 h-4" />
-                              Open In Octopai
-                            </button>
+                              <ExternalLink className="w-4 h-4" />
+                              Open NiFi
+                            </a>
                           )}
-                          
-                          {/* Open In UDF button - only for Trino containers */}
-                          {item.name.includes('trino') && item.status === 'running' && (
+
+                          {/* Open in UDF — for Trino */}
+                          {item.name.includes('trino') && (item.status === 'running' || item.status?.includes('Up')) && (
                             <button
                               onClick={(e) => {
                                 e.stopPropagation();
                                 navigate('/udf-catalog/search?platform=Trino');
                               }}
-                              className="flex items-center gap-1 px-3 py-1 text-sm bg-green-600 text-white hover:bg-green-700 rounded"
+                              className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium bg-green-600 text-white hover:bg-green-700 rounded-md shadow-sm"
                             >
                               <Database className="w-4 h-4" />
                               Open in UDF
                             </button>
                           )}
-                          
+
+                          {/* Open Hue SQL Editor */}
+                          {item.name.includes('hue') && item.status === 'running' && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                navigate(`/tool/hue/${item.id}`);
+                              }}
+                              className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium border border-green-300 text-green-600 hover:bg-green-50 rounded-md"
+                            >
+                              <ScrollText className="w-4 h-4" />
+                              Open SQL Editor
+                            </button>
+                          )}
+
                           <div className="relative action-menu-container">
                             <button
                               onClick={(e) => {

@@ -6,11 +6,16 @@ import {
   GitBranch,
   Layers,
   FileText,
-  Filter,
   TrendingUp,
   Clock,
   Tag,
   ExternalLink,
+  ChevronRight,
+  ChevronDown,
+  Table2,
+  Server,
+  FolderOpen,
+  Columns,
 } from 'lucide-react';
 import config from '../config';
 
@@ -20,26 +25,45 @@ interface Entity {
   name: string;
   platform?: string;
   description?: string;
-  lastModified?: number;
+  properties?: Record<string, string>;
 }
 
-interface PlatformStats {
-  platform: string;
-  count: number;
-  icon: any;
+interface HierarchyNode {
+  server: string;
+  databases: {
+    name: string;
+    schemas: {
+      name: string;
+      tables: Entity[];
+    }[];
+  }[];
 }
+
+interface PlatformHierarchy {
+  platform: string;
+  processorCount?: number;
+  tableCount?: number;
+  hierarchy?: HierarchyNode[];
+  processors?: Entity[];
+}
+
 
 const UDFCatalogHome = () => {
   const navigate = useNavigate();
   const [searchQuery, setSearchQuery] = useState('');
   const [recentEntities, setRecentEntities] = useState<Entity[]>([]);
-  const [platformStats, setPlatformStats] = useState<PlatformStats[]>([]);
+  const [platformHierarchies, setPlatformHierarchies] = useState<PlatformHierarchy[]>([]);
+  const [expandedPlatforms, setExpandedPlatforms] = useState<Set<string>>(new Set());
+  const [expandedServers, setExpandedServers] = useState<Set<string>>(new Set());
+  const [expandedDbs, setExpandedDbs] = useState<Set<string>>(new Set());
+  const [expandedSchemas, setExpandedSchemas] = useState<Set<string>>(new Set());
+  const [, setExpandedTables] = useState<Set<string>>(new Set());
+  // Map from tableUrn -> column names (loaded lazily on expand)
+  const [tableColumns, setTableColumns] = useState<Record<string, string[]>>({});
+  const [loadingColumns, setLoadingColumns] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const DATAHUB_GRAPHQL = 'http://localhost:8080/api/graphql';
-
-  // Fetch recent entities and platform stats
   useEffect(() => {
     fetchCatalogData();
   }, []);
@@ -49,36 +73,143 @@ const UDFCatalogHome = () => {
       setLoading(true);
       setError(null);
 
-      // Use Atlas API
-      console.log('[UDFCatalogHome] Using Atlas API - fetching catalog data');
-      const searchResponse = await fetch(`${config.backendUrl}/api/atlas/search?query=*&count=100`);
-      const platformsResponse = await fetch(`${config.backendUrl}/api/atlas/platforms`);
+      const [searchRes, platformsRes] = await Promise.all([
+        fetch(`${config.backendUrl}/api/atlas/search?query=*&count=100`),
+        fetch(`${config.backendUrl}/api/atlas/platforms`),
+      ]);
 
-      if (!searchResponse.ok || !platformsResponse.ok) {
-        throw new Error('Failed to fetch catalog data');
+      if (!searchRes.ok || !platformsRes.ok) throw new Error('Failed to fetch catalog data');
+
+      const searchData = await searchRes.json();
+      const platformsData = await platformsRes.json();
+
+      const allEntities: Entity[] = searchData.results.map((e: any) => ({
+        urn: e.urn,
+        type: e.type,
+        name: e.name || e.urn.split('/').pop(),
+        platform: e.platform || 'Unknown',
+        description: e.description || '',
+        properties: e.properties || {},
+      }));
+
+      // Recent: processors + tables only
+      const recent = allEntities
+        .filter(e => e.type === 'TABLE' || (!['CONTAINER', 'COLUMN', 'SCHEMA', 'DATABASE'].includes(e.type)))
+        .slice(0, 10);
+      setRecentEntities(recent);
+
+      // Build per-platform hierarchies
+      const platformStats: Record<string, number> = {};
+      platformsData.platforms.forEach((p: any) => { platformStats[p.platform] = p.count; });
+
+      const hierarchies: PlatformHierarchy[] = [];
+
+      // NiFi: list processors
+      const nifiProcessors = allEntities.filter(
+        e => e.platform === 'NiFi' && !['CONTAINER', 'COLUMN', 'SCHEMA', 'DATABASE'].includes(e.type)
+      );
+      if (nifiProcessors.length > 0 || platformStats['NiFi']) {
+        hierarchies.push({
+          platform: 'NiFi',
+          processorCount: platformStats['NiFi'] ?? nifiProcessors.length,
+          processors: nifiProcessors,
+        });
       }
 
-      const searchData = await searchResponse.json();
-      const platformsData = await platformsResponse.json();
+      // JDBC platforms: build Server→DB→Schema→Table tree
+      const jdbcPlatforms = [...new Set(
+        allEntities.filter(e => e.platform !== 'NiFi').map(e => e.platform!)
+      )];
 
-      const entities = searchData.results.map((entity: any) => ({
-        urn: entity.urn,
-        type: entity.type,
-        name: entity.name || extractNameFromUrn(entity.urn),
-        platform: entity.platform || 'Unknown',
-        description: entity.description || '',
-      }));
+      for (const platform of jdbcPlatforms) {
+        const tables = allEntities.filter(e => e.platform === platform && e.type === 'TABLE');
+        const tree: Record<string, Record<string, Record<string, Entity[]>>> = {};
 
-      setRecentEntities(entities.slice(0, 10));
+        for (const table of tables) {
+          const server = table.properties?.server || 'unknown';
+          const db = table.properties?.database || 'unknown';
+          const schema = table.properties?.schema || 'unknown';
+          if (!tree[server]) tree[server] = {};
+          if (!tree[server][db]) tree[server][db] = {};
+          if (!tree[server][db][schema]) tree[server][db][schema] = [];
+          tree[server][db][schema].push(table);
+        }
 
-      // Use platform stats from backend
-      const platformStatsArray = platformsData.platforms.map((p: any) => ({
-        platform: p.platform,
-        count: p.count,
-        icon: getPlatformIcon(p.platform),
-      }));
+        const hierarchy: HierarchyNode[] = Object.entries(tree).map(([server, dbs]) => ({
+          server,
+          databases: Object.entries(dbs).map(([dbName, schemas]) => ({
+            name: dbName,
+            schemas: Object.entries(schemas).map(([schemaName, tbls]) => ({
+              name: schemaName,
+              tables: tbls,
+            })),
+          })),
+        }));
 
-      setPlatformStats(platformStatsArray);
+        hierarchies.push({
+          platform,
+          tableCount: platformStats[platform] ?? tables.length,
+          hierarchy,
+        });
+      }
+
+      setPlatformHierarchies(hierarchies);
+
+      // Auto-expand all JDBC platforms, servers, dbs, schemas, and tables
+      const autoExpandPlatforms = new Set<string>();
+      const autoExpandServers = new Set<string>();
+      const autoExpandDbs = new Set<string>();
+      const autoExpandSchemas = new Set<string>();
+      const autoExpandTables = new Set<string>();
+
+      hierarchies.forEach(ph => {
+        if (ph.platform !== 'NiFi') {
+          autoExpandPlatforms.add(ph.platform);
+          ph.hierarchy?.forEach(serverNode => {
+            const serverKey = `${ph.platform}::${serverNode.server}`;
+            autoExpandServers.add(serverKey);
+            serverNode.databases.forEach(dbNode => {
+              const dbKey = `${serverKey}::${dbNode.name}`;
+              autoExpandDbs.add(dbKey);
+              dbNode.schemas.forEach(schemaNode => {
+                const schemaKey = `${dbKey}::${schemaNode.name}`;
+                autoExpandSchemas.add(schemaKey);
+                schemaNode.tables.forEach(table => {
+                  autoExpandTables.add(table.urn);
+                });
+              });
+            });
+          });
+        }
+      });
+
+      setExpandedPlatforms(autoExpandPlatforms);
+      setExpandedServers(autoExpandServers);
+      setExpandedDbs(autoExpandDbs);
+      setExpandedSchemas(autoExpandSchemas);
+      setExpandedTables(autoExpandTables);
+
+      // Pre-fetch columns for all tables
+      const allTableUrns = [...autoExpandTables];
+      const colResults = await Promise.all(
+        allTableUrns.map(async urn => {
+          try {
+            const res = await fetch(`${config.backendUrl}/api/atlas/entity/columns?table_urn=${encodeURIComponent(urn)}`);
+            if (!res.ok) return { urn, cols: [] as string[] };
+            const data = await res.json();
+            const cols: string[] = (data.columns || []).map((c: any) =>
+              c.name || c.Name || c.urn?.split('/column/').pop() || ''
+            ).filter(Boolean);
+            return { urn, cols };
+          } catch {
+            return { urn, cols: [] as string[] };
+          }
+        })
+      );
+      const colMap: Record<string, string[]> = {};
+      colResults.forEach(({ urn, cols }) => { colMap[urn] = cols; });
+      setTableColumns(colMap);
+
     } catch (err: any) {
       console.error('Failed to fetch catalog data:', err);
       setError(err.message);
@@ -87,17 +218,30 @@ const UDFCatalogHome = () => {
     }
   };
 
-  const extractNameFromUrn = (urn: string): string => {
-    const parts = urn.split(':');
-    return parts[parts.length - 1] || urn;
-  };
-
-  const getPlatformIcon = (platform: string) => {
-    const platformLower = platform.toLowerCase();
-    if (platformLower.includes('nifi')) return GitBranch;
-    if (platformLower.includes('file')) return FileText;
-    if (platformLower.includes('kafka')) return Layers;
-    return Database;
+  const fetchColumnsForTable = async (tableUrn: string) => {
+    if (tableColumns[tableUrn] !== undefined || loadingColumns.has(tableUrn)) return;
+    setLoadingColumns(prev => new Set(prev).add(tableUrn));
+    try {
+      const res = await fetch(
+        `${config.backendUrl}/api/atlas/entity/columns?table_urn=${encodeURIComponent(tableUrn)}`
+      );
+      if (res.ok) {
+        const data = await res.json();
+        // Response is array of column objects or URNs
+        const cols: string[] = (data.columns || data || []).map((c: any) => {
+          if (typeof c === 'string') return c.split('/column/').pop() || c;
+          // ColumnInfoDto has Name (C# Pascal case serialized as camelCase)
+          return c.name || c.Name || c.urn?.split('/column/').pop() || c.Urn?.split('/column/').pop() || '';
+        }).filter(Boolean);
+        setTableColumns(prev => ({ ...prev, [tableUrn]: cols }));
+      } else {
+        setTableColumns(prev => ({ ...prev, [tableUrn]: [] }));
+      }
+    } catch {
+      setTableColumns(prev => ({ ...prev, [tableUrn]: [] }));
+    } finally {
+      setLoadingColumns(prev => { const s = new Set(prev); s.delete(tableUrn); return s; });
+    }
   };
 
   const handleSearch = (e: React.FormEvent) => {
@@ -107,33 +251,48 @@ const UDFCatalogHome = () => {
     }
   };
 
-  const handleEntityClick = (urn: string) => {
-    navigate(`/udf-catalog/entity/${encodeURIComponent(urn)}`);
+  const togglePlatform = (platform: string) => {
+    setExpandedPlatforms(prev => {
+      const next = new Set(prev);
+      next.has(platform) ? next.delete(platform) : next.add(platform);
+      return next;
+    });
+  };
+
+  const toggleKey = (setter: React.Dispatch<React.SetStateAction<Set<string>>>, key: string) => {
+    setter(prev => {
+      const next = new Set(prev);
+      next.has(key) ? next.delete(key) : next.add(key);
+      return next;
+    });
+  };
+
+  const getPlatformColor = (platform: string) => {
+    if (platform === 'NiFi') return { bg: 'bg-blue-50', border: 'border-blue-200', badge: 'bg-blue-100 text-blue-700', icon: 'text-blue-600' };
+    if (platform === 'MSSQL') return { bg: 'bg-red-50', border: 'border-red-200', badge: 'bg-red-100 text-red-700', icon: 'text-red-600' };
+    if (platform === 'Snowflake') return { bg: 'bg-cyan-50', border: 'border-cyan-200', badge: 'bg-cyan-100 text-cyan-700', icon: 'text-cyan-600' };
+    return { bg: 'bg-gray-50', border: 'border-gray-200', badge: 'bg-gray-100 text-gray-700', icon: 'text-gray-600' };
   };
 
   const getEntityTypeIcon = (type: string) => {
-    switch (type.toLowerCase()) {
-      case 'dataset':
-        return Database;
-      case 'dataflow':
-      case 'dataprocess':
-        return GitBranch;
-      default:
-        return FileText;
-    }
+    if (type === 'TABLE') return Table2;
+    if (type === 'DATABASE') return Database;
+    if (type === 'SCHEMA') return FolderOpen;
+    if (type === 'CONTAINER') return Layers;
+    if (type === 'COLUMN') return Columns;
+    if (type?.includes('nifi')) return GitBranch;
+    return FileText;
   };
 
   return (
     <div className="min-h-screen bg-gray-50">
-      {/* Hero Section */}
+      {/* Hero */}
       <div className="bg-gradient-to-r from-blue-600 to-blue-700 text-white">
         <div className="max-w-7xl mx-auto px-8 py-12">
           <h1 className="text-4xl font-bold mb-4">UDF Data Catalog</h1>
           <p className="text-blue-100 text-lg mb-8">
             Discover, explore, and understand your data assets with column-level lineage and real-time metadata
           </p>
-
-          {/* Search Bar */}
           <form onSubmit={handleSearch} className="max-w-3xl">
             <div className="relative">
               <Search className="absolute left-4 top-1/2 transform -translate-y-1/2 w-5 h-5 text-gray-400" />
@@ -152,23 +311,21 @@ const UDFCatalogHome = () => {
               </button>
             </div>
           </form>
-
-          {/* Quick Links */}
           <div className="flex gap-4 mt-6">
             <button
-              onClick={() => navigate('/udf-catalog/search?type=dataset')}
+              onClick={() => navigate('/udf-catalog/search?type=TABLE')}
               className="px-4 py-2 bg-blue-500 hover:bg-blue-600 rounded-md text-sm font-medium transition-colors"
             >
-              Browse Datasets
+              Browse Tables
             </button>
             <button
-              onClick={() => navigate('/udf-catalog/search?type=dataFlow')}
+              onClick={() => navigate('/udf-catalog/search?platform=NiFi')}
               className="px-4 py-2 bg-blue-500 hover:bg-blue-600 rounded-md text-sm font-medium transition-colors"
             >
               Browse Pipelines
             </button>
             <button
-              onClick={() => window.open(config.dataHubUrl, '_blank')}
+              onClick={() => window.open('http://localhost:9002', '_blank')}
               className="px-4 py-2 bg-white/10 hover:bg-white/20 rounded-md text-sm font-medium transition-colors flex items-center gap-2"
             >
               Open DataHub UI
@@ -184,138 +341,280 @@ const UDFCatalogHome = () => {
           <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
             <p className="font-medium">Error loading catalog data</p>
             <p className="text-sm mt-1">{error}</p>
-            <button
-              onClick={fetchCatalogData}
-              className="mt-2 text-sm underline hover:no-underline"
-            >
-              Try again
-            </button>
+            <button onClick={fetchCatalogData} className="mt-2 text-sm underline">Try again</button>
           </div>
         )}
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          {/* Left Column - Platform Stats */}
-          <div className="lg:col-span-1">
+          {/* Left: Platform Hierarchy Tree */}
+          <div className="lg:col-span-1 space-y-4">
             <div className="bg-white rounded-lg border border-gray-200 p-6">
               <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
                 <Layers className="w-5 h-5 text-cloudera-blue" />
                 Platforms
               </h2>
-              
+
               {loading ? (
                 <div className="space-y-3">
-                  {[1, 2, 3].map((i) => (
-                    <div key={i} className="animate-pulse">
-                      <div className="h-12 bg-gray-100 rounded"></div>
-                    </div>
-                  ))}
+                  {[1, 2, 3].map(i => <div key={i} className="animate-pulse h-12 bg-gray-100 rounded" />)}
                 </div>
-              ) : platformStats.length > 0 ? (
+              ) : platformHierarchies.length === 0 ? (
+                <p className="text-gray-500 text-sm">No platforms found</p>
+              ) : (
                 <div className="space-y-2">
-                  {platformStats.map((stat) => {
-                    const Icon = stat.icon;
+                  {platformHierarchies.map(ph => {
+                    const colors = getPlatformColor(ph.platform);
+                    const isExpanded = expandedPlatforms.has(ph.platform);
+                    const count = ph.processorCount ?? ph.tableCount ?? 0;
+
                     return (
-                      <button
-                        key={stat.platform}
-                        onClick={() => navigate(`/udf-catalog/search?platform=${stat.platform}`)}
-                        className="w-full flex items-center justify-between p-3 rounded-lg hover:bg-gray-50 transition-colors border border-gray-100"
-                      >
-                        <div className="flex items-center gap-3">
-                          <div className="w-10 h-10 bg-blue-50 rounded-lg flex items-center justify-center">
-                            <Icon className="w-5 h-5 text-cloudera-blue" />
+                      <div key={ph.platform} className={`rounded-lg border ${colors.border} overflow-hidden`}>
+                        {/* Platform header */}
+                        <button
+                          onClick={() => togglePlatform(ph.platform)}
+                          className={`w-full flex items-center justify-between p-3 ${colors.bg} hover:opacity-90 transition-opacity`}
+                        >
+                          <div className="flex items-center gap-2">
+                            {isExpanded
+                              ? <ChevronDown className={`w-4 h-4 ${colors.icon}`} />
+                              : <ChevronRight className={`w-4 h-4 ${colors.icon}`} />}
+                            <Database className={`w-4 h-4 ${colors.icon}`} />
+                            <span className="font-semibold text-gray-900">{ph.platform}</span>
                           </div>
-                          <span className="font-medium text-gray-900">{stat.platform}</span>
-                        </div>
-                        <span className="text-2xl font-semibold text-cloudera-blue">{stat.count}</span>
-                      </button>
+                          <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${colors.badge}`}>
+                            {count} {ph.platform === 'NiFi' ? 'processors' : 'tables'}
+                          </span>
+                        </button>
+
+                        {/* Expanded: NiFi processors list */}
+                        {isExpanded && ph.platform === 'NiFi' && ph.processors && (
+                          <div className="bg-white divide-y divide-gray-100">
+                            {ph.processors.map(proc => (
+                              <button
+                                key={proc.urn}
+                                onClick={() => navigate(`/udf-catalog/entity/${encodeURIComponent(proc.urn)}`)}
+                                className="w-full flex items-center gap-2 px-4 py-2 hover:bg-blue-50 text-left"
+                              >
+                                <GitBranch className="w-3.5 h-3.5 text-blue-500 flex-shrink-0" />
+                                <span className="text-sm text-gray-800 truncate">{proc.name}</span>
+                              </button>
+                            ))}
+                            <button
+                              onClick={() => navigate('/udf-catalog/search?platform=NiFi')}
+                              className="w-full text-center py-2 text-xs text-blue-600 hover:bg-blue-50"
+                            >
+                              View all in search →
+                            </button>
+                          </div>
+                        )}
+
+                        {/* Expanded: JDBC Server→DB→Schema→Table tree */}
+                        {isExpanded && ph.platform !== 'NiFi' && ph.hierarchy && (
+                          <div className="bg-white">
+                            {ph.hierarchy.map(serverNode => {
+                              const serverKey = `${ph.platform}::${serverNode.server}`;
+                              const serverExpanded = expandedServers.has(serverKey);
+                              return (
+                                <div key={serverKey}>
+                                  {/* Server */}
+                                  <button
+                                    onClick={() => toggleKey(setExpandedServers, serverKey)}
+                                    className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 border-t border-gray-100"
+                                  >
+                                    {serverExpanded ? <ChevronDown className="w-3.5 h-3.5 text-gray-400" /> : <ChevronRight className="w-3.5 h-3.5 text-gray-400" />}
+                                    <Server className="w-3.5 h-3.5 text-gray-500" />
+                                    <span className="text-sm font-medium text-gray-700">{serverNode.server}</span>
+                                  </button>
+
+                                  {serverExpanded && serverNode.databases.map(dbNode => {
+                                    const dbKey = `${serverKey}::${dbNode.name}`;
+                                    const dbExpanded = expandedDbs.has(dbKey);
+                                    return (
+                                      <div key={dbKey}>
+                                        {/* Database */}
+                                        <button
+                                          onClick={() => toggleKey(setExpandedDbs, dbKey)}
+                                          className="w-full flex items-center gap-2 pl-7 pr-3 py-2 hover:bg-gray-50 border-t border-gray-100"
+                                        >
+                                          {dbExpanded ? <ChevronDown className="w-3.5 h-3.5 text-gray-400" /> : <ChevronRight className="w-3.5 h-3.5 text-gray-400" />}
+                                          <Database className="w-3.5 h-3.5 text-indigo-500" />
+                                          <span className="text-sm text-gray-700">{dbNode.name}</span>
+                                        </button>
+
+                                        {dbExpanded && dbNode.schemas.map(schemaNode => {
+                                          const schemaKey = `${dbKey}::${schemaNode.name}`;
+                                          const schemaExpanded = expandedSchemas.has(schemaKey);
+                                          return (
+                                            <div key={schemaKey}>
+                                              {/* Schema */}
+                                              <button
+                                                onClick={() => toggleKey(setExpandedSchemas, schemaKey)}
+                                                className="w-full flex items-center gap-2 pl-12 pr-3 py-2 hover:bg-gray-50 border-t border-gray-100"
+                                              >
+                                                {schemaExpanded ? <ChevronDown className="w-3.5 h-3.5 text-gray-400" /> : <ChevronRight className="w-3.5 h-3.5 text-gray-400" />}
+                                                <FolderOpen className="w-3.5 h-3.5 text-yellow-500" />
+                                                <span className="text-sm text-gray-700">{schemaNode.name}</span>
+                                                <span className="ml-auto text-xs text-gray-400">{schemaNode.tables.length}</span>
+                                              </button>
+
+                                              {/* Tables + Columns (always expanded) */}
+                                              {schemaExpanded && schemaNode.tables.map(table => {
+                                                const cols = tableColumns[table.urn];
+                                                const isLoadingCols = loadingColumns.has(table.urn);
+                                                return (
+                                                  <div key={table.urn}>
+                                                    {/* Table row */}
+                                                    <div className="flex items-center border-t border-gray-100">
+                                                      <button
+                                                        onClick={() => navigate(`/udf-catalog/entity/${encodeURIComponent(table.urn)}`)}
+                                                        className="flex-1 flex items-center gap-2 pl-16 pr-3 py-2 hover:bg-green-50 text-left"
+                                                      >
+                                                        <Table2 className="w-3.5 h-3.5 text-green-600 flex-shrink-0" />
+                                                        <span className="text-sm text-gray-800 font-medium truncate">{table.name}</span>
+                                                        {isLoadingCols && (
+                                                          <span className="ml-auto text-xs text-gray-400 animate-pulse">loading...</span>
+                                                        )}
+                                                        {!isLoadingCols && cols && cols.length > 0 && (
+                                                          <span className="ml-auto text-xs text-gray-400">{cols.length} cols</span>
+                                                        )}
+                                                      </button>
+                                                    </div>
+                                                    {/* Columns — always shown */}
+                                                    {isLoadingCols && (
+                                                      <div className="pl-20 pr-3 py-1.5 bg-gray-50 border-t border-gray-100">
+                                                        <span className="text-xs text-gray-400 animate-pulse">Loading columns...</span>
+                                                      </div>
+                                                    )}
+                                                    {cols && cols.map(col => {
+                                                      const colUrn = `${table.urn}/column/${col}`;
+                                                      return (
+                                                        <button
+                                                          key={col}
+                                                          onClick={() => navigate(`/udf-catalog/entity/${encodeURIComponent(colUrn)}`)}
+                                                          className="w-full flex items-center gap-2 pl-20 pr-3 py-1 bg-gray-50 border-t border-gray-100 hover:bg-purple-50 text-left transition-colors"
+                                                        >
+                                                          <Columns className="w-3 h-3 text-purple-400 flex-shrink-0" />
+                                                          <span className="text-xs text-gray-600 hover:text-purple-700">{col}</span>
+                                                        </button>
+                                                      );
+                                                    })}
+                                                  </div>
+                                                );
+                                              })}
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              );
+                            })}
+                            <button
+                              onClick={() => navigate(`/udf-catalog/search?platform=${ph.platform}`)}
+                              className="w-full text-center py-2 text-xs text-blue-600 hover:bg-blue-50 border-t border-gray-100"
+                            >
+                              View all in search →
+                            </button>
+                          </div>
+                        )}
+                      </div>
                     );
                   })}
                 </div>
-              ) : (
-                <p className="text-gray-500 text-sm">No platforms found</p>
               )}
             </div>
 
             {/* Quick Actions */}
-            <div className="mt-6 bg-white rounded-lg border border-gray-200 p-6">
+            <div className="bg-white rounded-lg border border-gray-200 p-6">
               <h2 className="text-lg font-semibold mb-4">Quick Actions</h2>
               <div className="space-y-2">
-                <button className="w-full text-left px-3 py-2 rounded-lg hover:bg-gray-50 transition-colors flex items-center gap-2 text-sm">
+                <button
+                  onClick={() => navigate('/udf-catalog/search?type=TABLE')}
+                  className="w-full text-left px-3 py-2 rounded-lg hover:bg-gray-50 transition-colors flex items-center gap-2 text-sm"
+                >
                   <TrendingUp className="w-4 h-4 text-gray-600" />
-                  Most Popular Datasets
+                  Browse Tables
                 </button>
-                <button className="w-full text-left px-3 py-2 rounded-lg hover:bg-gray-50 transition-colors flex items-center gap-2 text-sm">
+                <button
+                  onClick={() => navigate('/udf-catalog/search?platform=NiFi')}
+                  className="w-full text-left px-3 py-2 rounded-lg hover:bg-gray-50 transition-colors flex items-center gap-2 text-sm"
+                >
                   <Clock className="w-4 h-4 text-gray-600" />
-                  Recently Updated
+                  Browse NiFi Processors
                 </button>
-                <button className="w-full text-left px-3 py-2 rounded-lg hover:bg-gray-50 transition-colors flex items-center gap-2 text-sm">
+                <button
+                  onClick={() => navigate('/udf-catalog/search')}
+                  className="w-full text-left px-3 py-2 rounded-lg hover:bg-gray-50 transition-colors flex items-center gap-2 text-sm"
+                >
                   <Tag className="w-4 h-4 text-gray-600" />
-                  Browse by Tags
+                  Search All Entities
                 </button>
               </div>
             </div>
           </div>
 
-          {/* Right Column - Recent Entities */}
+          {/* Right: Recent Entities */}
           <div className="lg:col-span-2">
             <div className="bg-white rounded-lg border border-gray-200">
-              <div className="p-6 border-b border-gray-200">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-lg font-semibold flex items-center gap-2">
-                    <Clock className="w-5 h-5 text-cloudera-blue" />
-                    Recently Updated Entities
-                  </h2>
-                  <button
-                    onClick={fetchCatalogData}
-                    className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
-                    title="Refresh"
-                  >
-                    <Filter className="w-4 h-4 text-gray-600" />
-                  </button>
-                </div>
+              <div className="p-6 border-b border-gray-200 flex items-center justify-between">
+                <h2 className="text-lg font-semibold flex items-center gap-2">
+                  <Clock className="w-5 h-5 text-cloudera-blue" />
+                  Recently Updated Entities
+                </h2>
+                <button onClick={fetchCatalogData} className="p-2 hover:bg-gray-100 rounded-lg" title="Refresh">
+                  <Search className="w-4 h-4 text-gray-600" />
+                </button>
               </div>
 
               <div className="divide-y divide-gray-200">
                 {loading ? (
                   <div className="p-6 space-y-4">
-                    {[1, 2, 3, 4, 5].map((i) => (
-                      <div key={i} className="animate-pulse">
-                        <div className="h-20 bg-gray-100 rounded"></div>
-                      </div>
+                    {[1, 2, 3, 4, 5].map(i => (
+                      <div key={i} className="animate-pulse h-20 bg-gray-100 rounded" />
                     ))}
                   </div>
                 ) : recentEntities.length > 0 ? (
-                  recentEntities.map((entity) => {
+                  recentEntities.map(entity => {
                     const Icon = getEntityTypeIcon(entity.type);
+                    const colors = getPlatformColor(entity.platform || '');
+
+                    // Build breadcrumb for TABLE entities
+                    const breadcrumb = entity.type === 'TABLE' && entity.properties
+                      ? [entity.properties.server, entity.properties.database, entity.properties.schema, entity.name].filter(Boolean)
+                      : null;
+
                     return (
                       <button
                         key={entity.urn}
-                        onClick={() => handleEntityClick(entity.urn)}
-                        className="w-full p-6 hover:bg-gray-50 transition-colors text-left"
+                        onClick={() => navigate(`/udf-catalog/entity/${encodeURIComponent(entity.urn)}`)}
+                        className="w-full p-4 hover:bg-gray-50 transition-colors text-left"
                       >
-                        <div className="flex items-start gap-4">
-                          <div className="w-12 h-12 bg-blue-50 rounded-lg flex items-center justify-center flex-shrink-0">
-                            <Icon className="w-6 h-6 text-cloudera-blue" />
+                        <div className="flex items-start gap-3">
+                          <div className={`w-10 h-10 ${colors.bg} rounded-lg flex items-center justify-center flex-shrink-0`}>
+                            <Icon className={`w-5 h-5 ${colors.icon}`} />
                           </div>
                           <div className="flex-1 min-w-0">
-                            <h3 className="font-semibold text-gray-900 mb-1 truncate">
-                              {entity.name}
-                            </h3>
-                            <div className="flex items-center gap-2 mb-2">
-                              <span className="inline-block px-2 py-0.5 bg-blue-100 text-blue-700 text-xs font-medium rounded">
-                                {entity.type}
-                              </span>
-                              {entity.platform && (
-                                <span className="inline-block px-2 py-0.5 bg-gray-100 text-gray-700 text-xs font-medium rounded">
-                                  {entity.platform}
-                                </span>
-                              )}
-                            </div>
-                            {entity.description && (
-                              <p className="text-sm text-gray-600 line-clamp-2">
-                                {entity.description}
-                              </p>
+                            {breadcrumb ? (
+                              <div className="flex items-center gap-1 text-xs text-gray-400 mb-1 flex-wrap">
+                                {breadcrumb.map((part, i) => (
+                                  <span key={i} className="flex items-center gap-1">
+                                    {i > 0 && <ChevronRight className="w-3 h-3" />}
+                                    <span className={i === breadcrumb.length - 1 ? 'font-semibold text-gray-700' : ''}>{part}</span>
+                                  </span>
+                                ))}
+                              </div>
+                            ) : (
+                              <h3 className="font-semibold text-gray-900 mb-1 truncate">{entity.name}</h3>
                             )}
+                            <div className="flex items-center gap-2">
+                              <span className={`inline-block px-2 py-0.5 text-xs font-medium rounded ${colors.badge}`}>
+                                {entity.platform}
+                              </span>
+                              <span className="inline-block px-2 py-0.5 bg-gray-100 text-gray-600 text-xs font-medium rounded">
+                                {entity.type === 'TABLE' ? 'TABLE' : entity.type?.split('.').pop()}
+                              </span>
+                            </div>
                           </div>
                         </div>
                       </button>
@@ -325,9 +624,7 @@ const UDFCatalogHome = () => {
                   <div className="p-12 text-center">
                     <Database className="w-12 h-12 text-gray-300 mx-auto mb-4" />
                     <p className="text-gray-500">No entities found</p>
-                    <p className="text-sm text-gray-400 mt-1">
-                      Start by creating NiFi flows or ingesting data
-                    </p>
+                    <p className="text-sm text-gray-400 mt-1">Start by creating NiFi flows or ingesting data</p>
                   </div>
                 )}
               </div>

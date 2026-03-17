@@ -565,40 +565,67 @@ public sealed class OpenSearchRepository : ISearchRepository
     {
         try
         {
-            var searchRequest = new SearchRequest(_settings.IndexName)
+            // For NiFi: count only processors (not containers/process-groups/columns)
+            // For JDBC platforms (MSSQL, Snowflake, etc.): count only TABLE entities
+            // We run two queries and merge results.
+
+            var platformStats = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+            // --- Query 1: NiFi processors only (exclude CONTAINER, COLUMN, SCHEMA, DATABASE) ---
+            var nifiRequest = new SearchRequest(_settings.IndexName)
             {
-                Query = new MatchAllQuery(),
+                Query = new BoolQuery
+                {
+                    Must = new List<QueryContainer>
+                    {
+                        new TermQuery { Field = "platform.keyword", Value = "NiFi" }
+                    },
+                    MustNot = new List<QueryContainer>
+                    {
+                        new TermQuery { Field = "type.keyword", Value = "CONTAINER" },
+                        new TermQuery { Field = "type.keyword", Value = "COLUMN" },
+                        new TermQuery { Field = "type.keyword", Value = "SCHEMA" },
+                        new TermQuery { Field = "type.keyword", Value = "DATABASE" }
+                    }
+                },
                 Size = 0,
                 Aggregations = new AggregationDictionary
                 {
-                    {
-                        "platforms",
-                        new TermsAggregation("platforms")
-                        {
-                            Field = "platform.keyword",
-                            Size = 100
-                        }
-                    }
+                    { "platforms", new TermsAggregation("platforms") { Field = "platform.keyword", Size = 100 } }
                 }
             };
 
-            var response = await _client.SearchAsync<ProcessorDocument>(searchRequest, cancellationToken);
+            var nifiResponse = await _client.SearchAsync<ProcessorDocument>(nifiRequest, cancellationToken);
+            if (nifiResponse.IsValid && nifiResponse.Total > 0)
+                platformStats["NiFi"] = (int)nifiResponse.Total;
 
-            if (!response.IsValid)
+            // --- Query 2: JDBC TABLE entities only (MSSQL, Snowflake, etc.) ---
+            var tableRequest = new SearchRequest(_settings.IndexName)
             {
-                _logger.LogError(
-                    "Get platform stats failed: {Error}",
-                    response.OriginalException?.Message ?? response.ServerError?.ToString());
-                return Domain.Common.Result<Dictionary<string, int>>.Failure(
-                    $"Get platform stats failed: {response.OriginalException?.Message}");
-            }
+                Query = new BoolQuery
+                {
+                    Must = new List<QueryContainer>
+                    {
+                        new TermQuery { Field = "type.keyword", Value = "TABLE" }
+                    },
+                    MustNot = new List<QueryContainer>
+                    {
+                        new TermQuery { Field = "platform.keyword", Value = "NiFi" }
+                    }
+                },
+                Size = 0,
+                Aggregations = new AggregationDictionary
+                {
+                    { "platforms", new TermsAggregation("platforms") { Field = "platform.keyword", Size = 100 } }
+                }
+            };
 
-            var platformStats = new Dictionary<string, int>();
-
-            if (response.Aggregations.TryGetValue("platforms", out var platformsAgg) &&
-                platformsAgg is BucketAggregate bucketAgg)
+            var tableResponse = await _client.SearchAsync<ProcessorDocument>(tableRequest, cancellationToken);
+            if (tableResponse.IsValid &&
+                tableResponse.Aggregations.TryGetValue("platforms", out var tableAgg) &&
+                tableAgg is BucketAggregate tableBucket)
             {
-                foreach (var bucket in bucketAgg.Items.OfType<KeyedBucket<object>>())
+                foreach (var bucket in tableBucket.Items.OfType<KeyedBucket<object>>())
                 {
                     var platform = bucket.Key.ToString() ?? "Unknown";
                     var count = (int)(bucket.DocCount ?? 0);
@@ -607,7 +634,6 @@ public sealed class OpenSearchRepository : ISearchRepository
             }
 
             _logger.LogDebug("Get platform stats returned {Count} platforms", platformStats.Count);
-
             return Domain.Common.Result<Dictionary<string, int>>.Success(platformStats);
         }
         catch (Exception ex)
@@ -954,15 +980,50 @@ public sealed class OpenSearchRepository : ISearchRepository
 
             var doc = response.Documents.First();
 
+            // Build properties — start with stored properties, then enrich with column data
+            var props = new Dictionary<string, string>(doc.Properties ?? new Dictionary<string, string>());
+
+            // Determine name: columns store it in Column.Name, processors in Name
+            var name = doc.Name;
+            var parentUrn = string.IsNullOrEmpty(doc.ParentProcessGroupId) ? doc.ParentContainerUrn : doc.ParentProcessGroupId;
+
+            if (doc.Column != null)
+            {
+                // Column entity — extract all column metadata into properties
+                if (!string.IsNullOrEmpty(doc.Column.Name)) name = doc.Column.Name;
+
+                var tableFqn = doc.Column.TableFqn?.Value ?? doc.Column.ProcessorFqn?.Value ?? parentUrn ?? string.Empty;
+                if (!string.IsNullOrEmpty(tableFqn)) props["parentFqn"] = tableFqn;
+
+                // Parse server/db/schema/table from the table FQN (jdbc://server/db/schema/table)
+                if (!string.IsNullOrEmpty(tableFqn) && tableFqn.StartsWith("jdbc://"))
+                {
+                    var parts = tableFqn.Replace("jdbc://", string.Empty).Split('/');
+                    if (parts.Length >= 1) props["server"] = parts[0];
+                    if (parts.Length >= 2) props["database"] = parts[1];
+                    if (parts.Length >= 3) props["schema"] = parts[2];
+                    if (parts.Length >= 4) props["table"] = parts[3];
+                }
+
+                if (!string.IsNullOrEmpty(doc.Column.DataType)) props["dataType"] = doc.Column.DataType;
+                if (!string.IsNullOrEmpty(doc.Column.NativeType)) props["nativeType"] = doc.Column.NativeType;
+                if (doc.Column.IsNullable.HasValue) props["nullable"] = doc.Column.IsNullable.Value ? "Yes" : "No";
+                if (doc.Column.IsPrimaryKey.HasValue) props["primaryKey"] = doc.Column.IsPrimaryKey.Value ? "Yes" : "No";
+                if (doc.Column.OrdinalPosition.HasValue) props["ordinalPosition"] = doc.Column.OrdinalPosition.Value.ToString();
+                if (doc.Column.Precision.HasValue) props["precision"] = doc.Column.Precision.Value.ToString();
+                if (doc.Column.Scale.HasValue) props["scale"] = doc.Column.Scale.Value.ToString();
+                if (!string.IsNullOrEmpty(doc.Column.Description)) props["description"] = doc.Column.Description;
+            }
+
             var dto = new Application.DTOs.AtlasEntityDto
             {
                 Urn = doc.Fqn,
                 Type = doc.Type ?? "DATASET",
-                Name = doc.Name,
+                Name = name,
                 Platform = doc.Platform ?? "Unknown",
                 Description = doc.Description ?? string.Empty,
-                Properties = doc.Properties ?? new Dictionary<string, string>(),
-                ParentContainerUrn = string.IsNullOrEmpty(doc.ParentProcessGroupId) ? null : doc.ParentProcessGroupId
+                Properties = props,
+                ParentContainerUrn = parentUrn
             };
 
             return Domain.Common.Result<Application.DTOs.AtlasEntityDto?>.Success(dto);

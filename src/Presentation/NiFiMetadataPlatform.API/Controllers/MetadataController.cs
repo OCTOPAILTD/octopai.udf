@@ -154,6 +154,14 @@ public sealed class MetadataController : ControllerBase
         var decodedUrn = Uri.UnescapeDataString(urn);
         urn = decodedUrn;
 
+        // For column URNs, the lineage handler returns entity-level nodes/edges
+        // filtered to the single column. We use the parent entity as the center node.
+        var isColumnUrn = urn.Contains("/column/", StringComparison.OrdinalIgnoreCase);
+        var columnName = isColumnUrn ? urn.Split('/').LastOrDefault() ?? string.Empty : string.Empty;
+        var centerNodeUrn = isColumnUrn
+            ? urn[..urn.LastIndexOf("/column/", StringComparison.OrdinalIgnoreCase)]
+            : urn;
+
         var query = new GetAtlasLineageQuery(urn, direction ?? "BOTH", depth, includeColumns);
         var result = await _mediator.Send(query, cancellationToken);
 
@@ -165,17 +173,17 @@ public sealed class MetadataController : ControllerBase
         var lineage = result.Value!;
 
         // Look up the center entity's name
-        var entityQuery = new GetEntityByUrnQuery(urn);
+        var entityQuery = new GetEntityByUrnQuery(centerNodeUrn);
         var entityResult = await _mediator.Send(entityQuery, cancellationToken);
         var centerName = entityResult.IsSuccess && entityResult.Value != null
             ? entityResult.Value.Name
-            : urn.Split('/').LastOrDefault() ?? urn;
+            : centerNodeUrn.Split('/').LastOrDefault() ?? centerNodeUrn;
         var centerPlatform = entityResult.IsSuccess && entityResult.Value != null
             ? entityResult.Value.Platform
-            : (urn.StartsWith("nifi://") ? "NiFi" : "Unknown");
+            : (centerNodeUrn.StartsWith("nifi://") ? "NiFi" : "Unknown");
 
         // Collect all entity URNs that will appear as nodes
-        var allEntityUrns = new HashSet<string> { urn };
+        var allEntityUrns = new HashSet<string> { centerNodeUrn };
         foreach (var e in lineage.Upstream) allEntityUrns.Add(e.Urn);
         foreach (var e in lineage.Downstream) allEntityUrns.Add(e.Urn);
         foreach (var cl in lineage.ColumnLineage)
@@ -184,30 +192,21 @@ public sealed class MetadataController : ControllerBase
             allEntityUrns.Add(cl.ToUrn);
         }
 
-        // Fetch columns for every entity in parallel
-        var columnTasks = allEntityUrns.ToDictionary(
-            entityUrn => entityUrn,
-            entityUrn => _searchRepository.GetColumnUrnsByProcessorFqnAsync(entityUrn, cancellationToken));
-        await Task.WhenAll(columnTasks.Values);
-
-        var entityColumns = new Dictionary<string, List<string>>();
-        foreach (var (entityUrn, task) in columnTasks)
-        {
-            var colResult = await task;
-            if (colResult.IsSuccess && colResult.Value != null && colResult.Value.Count > 0)
-            {
-                // Extract just the column name from the full column URN
-                entityColumns[entityUrn] = colResult.Value
-                    .Select(colUrn => colUrn.Split('/').LastOrDefault() ?? colUrn)
-                    .Distinct()
-                    .ToList();
-            }
-        }
-
-        // Helper to build a node object with columns populated
+        // For column lineage: each node shows only the relevant column.
+        // For entity lineage: each node shows all its columns.
         object BuildNode(string nodeUrn, string nodeType, string nodeName, string nodePlatform, bool isCenter)
         {
-            entityColumns.TryGetValue(nodeUrn, out var cols);
+            List<string> cols;
+            if (isColumnUrn)
+            {
+                // Show only the lineage column on each node
+                cols = new List<string> { columnName };
+            }
+            else
+            {
+                cols = new List<string>();
+            }
+
             return new
             {
                 urn = nodeUrn,
@@ -215,15 +214,15 @@ public sealed class MetadataController : ControllerBase
                 name = nodeName,
                 platform = nodePlatform,
                 isCenter,
-                columns = cols ?? new List<string>()
+                columns = cols,
             };
         }
 
-        // Build nodes and edges in the format the frontend LineageViewer expects
+        // Build nodes map
         var nodesMap = new Dictionary<string, object>();
 
-        // Add the current entity as center node
-        nodesMap[urn] = BuildNode(urn, "DATASET", centerName, centerPlatform, true);
+        // Add the center entity node
+        nodesMap[centerNodeUrn] = BuildNode(centerNodeUrn, "DATASET", centerName, centerPlatform, true);
 
         foreach (var entity in lineage.Upstream)
         {
@@ -257,13 +256,54 @@ public sealed class MetadataController : ControllerBase
             }
         }
 
+        // For entity lineage (non-column), populate columns from OpenSearch
+        if (!isColumnUrn)
+        {
+            var columnTasks = allEntityUrns.ToDictionary(
+                entityUrn => entityUrn,
+                entityUrn => _searchRepository.GetColumnUrnsByProcessorFqnAsync(entityUrn, cancellationToken));
+            await Task.WhenAll(columnTasks.Values);
+
+            var entityColumns = new Dictionary<string, List<string>>();
+            foreach (var (entityUrn, task) in columnTasks)
+            {
+                var colResult = await task;
+                if (colResult.IsSuccess && colResult.Value != null && colResult.Value.Count > 0)
+                {
+                    entityColumns[entityUrn] = colResult.Value
+                        .Select(colUrn => colUrn.Split('/').LastOrDefault() ?? colUrn)
+                        .Distinct()
+                        .ToList();
+                }
+            }
+
+            // Rebuild nodes with column data
+            var rebuiltNodes = new Dictionary<string, object>();
+            foreach (var (nodeUrn, node) in nodesMap)
+            {
+                entityColumns.TryGetValue(nodeUrn, out var cols);
+                var n = (dynamic)node;
+                rebuiltNodes[nodeUrn] = new
+                {
+                    urn = (string)n.urn,
+                    type = (string)n.type,
+                    name = (string)n.name,
+                    platform = (string)n.platform,
+                    isCenter = (bool)n.isCenter,
+                    columns = cols ?? new List<string>(),
+                };
+            }
+
+            nodesMap = rebuiltNodes;
+        }
+
         // Build edges from column lineage (source_dataset → target_dataset), deduped, no self-loops
         var edges = new List<object>();
         var edgeSet = new HashSet<string>();
 
         foreach (var cl in lineage.ColumnLineage)
         {
-            if (cl.FromUrn == cl.ToUrn) continue; // skip self-loops
+            if (cl.FromUrn == cl.ToUrn) continue;
             var edgeKey = $"{cl.FromUrn}→{cl.ToUrn}";
             if (edgeSet.Add(edgeKey) && nodesMap.ContainsKey(cl.FromUrn) && nodesMap.ContainsKey(cl.ToUrn))
             {

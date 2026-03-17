@@ -28,7 +28,7 @@ public sealed class NiFiMetadataIngestionService : INiFiMetadataIngestionService
     private readonly Dictionary<string, (string TableName, string? CatalogName, string? SchemaName, string Vendor, string? DbcpService)> _processorTableNameCache = new();
     
     // Cache for GSP lineage results (for creating table-to-processor edges)
-    private readonly Dictionary<string, (GSPLineageResult Result, string Vendor, string? DbcpService)> _gspLineageCache = new();
+    private readonly Dictionary<string, (GSPLineageResult Result, string Vendor, string? DbcpService, string? DbcpDatabase)> _gspLineageCache = new();
 
     public NiFiMetadataIngestionService(
         IHttpClientFactory httpClientFactory,
@@ -487,8 +487,10 @@ public sealed class NiFiMetadataIngestionService : INiFiMetadataIngestionService
                 
                 if (!string.IsNullOrWhiteSpace(sqlQuery))
                 {
-                    var vendor = DetermineVendor(properties);
-                    _logger.LogInformation("Parsing SQL with vendor: {Vendor}", vendor);
+                    var dbcpService = properties.GetValueOrDefault("Database Connection Pooling Service");
+                    var (vendor, dbcpDatabase) = await DetermineVendorAndDatabaseFromControllerServiceAsync(
+                        dbcpService, properties, httpClient, cancellationToken);
+                    _logger.LogInformation("Parsing SQL with vendor: {Vendor}, dbcpDatabase: {Database}", vendor, dbcpDatabase);
                     var gspResult = await _gspParser.ParseSqlAsync(sqlQuery, vendor, cancellationToken);
 
                     if (gspResult != null)
@@ -500,7 +502,7 @@ public sealed class NiFiMetadataIngestionService : INiFiMetadataIngestionService
                         // Ingest database tables and columns
                         foreach (var table in gspResult.SourceTables)
                         {
-                            await IngestDatabaseTableAsync(table, vendor, cancellationToken);
+                            await IngestDatabaseTableAsync(table, vendor, cancellationToken, dbcpDatabase);
                         }
 
                         // Add result columns to processor columns
@@ -510,8 +512,7 @@ public sealed class NiFiMetadataIngestionService : INiFiMetadataIngestionService
                         }));
                         
                         // Store GSP lineage for creating edges after processor columns are indexed
-                        var dbcpService = properties.GetValueOrDefault("Database Connection Pooling Service");
-                        _gspLineageCache[processorFqn.Value] = (gspResult, vendor, dbcpService);
+                        _gspLineageCache[processorFqn.Value] = (gspResult, vendor, dbcpService, dbcpDatabase);
                     }
                     else
                     {
@@ -541,12 +542,17 @@ public sealed class NiFiMetadataIngestionService : INiFiMetadataIngestionService
 
                 if (!string.IsNullOrWhiteSpace(tableName))
                 {
-                    // Fetch JDBC URL from controller service to determine vendor/platform
-                    var vendor = await DetermineVendorFromControllerServiceAsync(dbcpServiceId, properties, httpClient, cancellationToken);
+                    // Fetch JDBC URL from controller service to determine vendor/platform and database
+                    var (vendor, dbcpDatabase) = await DetermineVendorAndDatabaseFromControllerServiceAsync(
+                        dbcpServiceId, properties, httpClient, cancellationToken);
+
+                    // Use catalogName from NiFi properties; fall back to database parsed from JDBC URL
+                    var resolvedCatalog = catalogName ?? dbcpDatabase;
+
                     await IngestDatabaseTableFromNameAsync(tableName, vendor, cancellationToken);
 
                     // Store table info for later use (after column propagation)
-                    _processorTableNameCache[processorFqn.Value] = (tableName, catalogName, schemaName, vendor, dbcpServiceId);
+                    _processorTableNameCache[processorFqn.Value] = (tableName, resolvedCatalog, schemaName, vendor, dbcpServiceId);
                 }
             }
 
@@ -596,7 +602,7 @@ public sealed class NiFiMetadataIngestionService : INiFiMetadataIngestionService
             // If this processor has GSP lineage, create table-to-processor edges
             if (_gspLineageCache.TryGetValue(processorFqn.Value, out var gspInfo))
             {
-                await CreateTableToProcessorEdgesAsync(processorFqn, gspInfo.Result, gspInfo.Vendor, gspInfo.DbcpService, cancellationToken);
+                await CreateTableToProcessorEdgesAsync(processorFqn, gspInfo.Result, gspInfo.Vendor, gspInfo.DbcpService, gspInfo.DbcpDatabase, cancellationToken);
             }
 
             _logger.LogInformation("Completed column ingestion for processor {ProcessorId}: {Count} columns", processorId, columns.Count);
@@ -716,14 +722,44 @@ public sealed class NiFiMetadataIngestionService : INiFiMetadataIngestionService
     private async Task IngestDatabaseTableAsync(
         GSPTable gspTable,
         string vendor,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? dbcpDatabase = null)
     {
         try
         {
-            var server = "localhost"; // TODO: Parse from JDBC URL in properties
-            var database = gspTable.Database ?? "unknown";
+            var server = "localhost";
+            // Prefer GSP-provided database, then DBCP-derived database; skip if still unknown
+            var database = gspTable.Database ?? dbcpDatabase;
             var schema = gspTable.Schema ?? "dbo";
-            var tableName = gspTable.Name;
+            // GSP sometimes returns fully-qualified names like "PRODUCTS.dbo.PRODUCTS"
+            // Extract just the simple table name (last part after splitting by '.')
+            var rawName = gspTable.Name ?? string.Empty;
+            string tableName;
+            var nameParts = rawName.Split('.');
+            if (nameParts.Length >= 3)
+            {
+                // db.schema.table — override database and schema too if not already set
+                if (gspTable.Database == null) database = nameParts[0];
+                if (gspTable.Schema == null) schema = nameParts[1];
+                tableName = nameParts[2];
+            }
+            else if (nameParts.Length == 2)
+            {
+                if (gspTable.Schema == null) schema = nameParts[0];
+                tableName = nameParts[1];
+            }
+            else
+            {
+                tableName = rawName;
+            }
+
+            // If we still don't have a database name, skip indexing to avoid "unknown" records
+            if (string.IsNullOrWhiteSpace(database))
+            {
+                _logger.LogWarning("Skipping IngestDatabaseTableAsync for {TableName} — database name could not be determined", tableName);
+                return;
+            }
+
             var platform = MapVendorToPlatform(vendor);
 
             // Create database entity
@@ -801,36 +837,12 @@ public sealed class NiFiMetadataIngestionService : INiFiMetadataIngestionService
         string vendor,
         CancellationToken cancellationToken)
     {
-        try
-        {
-            // Parse table name (format: schema.table or just table)
-            var parts = tableName.Split('.');
-            var schema = parts.Length > 1 ? parts[0] : "dbo";
-            var table = parts.Length > 1 ? parts[1] : parts[0];
-
-            var server = "localhost";
-            var database = "unknown";
-            var platform = MapVendorToPlatform(vendor);
-
-            // Create minimal table entity (without columns since we don't have the schema)
-            var tableFqn = DatabaseFqn.CreateTable(server, database, schema, table);
-            var tableEntity = DatabaseTable.Create(
-                tableFqn,
-                table,
-                server,
-                database,
-                schema,
-                platform);
-
-            // Index table in OpenSearch ONLY (not in ArangoDB)
-            await _searchRepository.IndexTableAsync(tableEntity, cancellationToken);
-
-            _logger.LogDebug("Ingested database table {TableName}", tableName);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to ingest database table from name {TableName}", tableName);
-        }
+        // This is a fallback for when we only have the table name from NiFi properties.
+        // We skip indexing here because CreateTargetTableColumnsAndEdgesAsync will index
+        // the proper table with the correct catalog/schema from the DBCP service.
+        // Indexing with "unknown" database would create bad/duplicate records.
+        _logger.LogDebug("Skipping early IngestDatabaseTableFromNameAsync for {TableName} — will be indexed with full metadata later", tableName);
+        await Task.CompletedTask;
     }
 
     private async Task CreateTargetTableColumnsAndEdgesAsync(
@@ -844,10 +856,15 @@ public sealed class NiFiMetadataIngestionService : INiFiMetadataIngestionService
     {
         try
         {
-            // Use provided catalog/schema or parse from table name
-            var database = catalogName ?? "unknown";
+            var database = catalogName;
             var schema = schemaName ?? "dbo";
             var table = tableName;
+
+            if (string.IsNullOrWhiteSpace(database))
+            {
+                _logger.LogWarning("Skipping CreateTargetTableColumnsAndEdgesAsync for {TableName} — database name could not be determined", tableName);
+                return;
+            }
 
             var server = "localhost";
             var platform = MapVendorToPlatform(vendor);
@@ -911,14 +928,12 @@ public sealed class NiFiMetadataIngestionService : INiFiMetadataIngestionService
         GSPLineageResult gspResult,
         string vendor,
         string? dbcpService,
+        string? dbcpDatabase,
         CancellationToken cancellationToken)
     {
         try
         {
             var platform = MapVendorToPlatform(vendor);
-            
-            // TODO: Extract database and schema from DBCP Service
-            // For now, use GSP result or defaults
             
             // Create edges from source table columns to processor columns
             foreach (var lineage in gspResult.ColumnLineages)
@@ -928,10 +943,35 @@ public sealed class NiFiMetadataIngestionService : INiFiMetadataIngestionService
                 if (sourceTable == null) continue;
 
                 var parts = sourceTable.Name.Split('.');
-                var schema = sourceTable.Schema ?? (parts.Length > 1 ? parts[^2] : "dbo");
-                var table = parts[^1];
                 var server = "localhost";
-                var database = sourceTable.Database ?? "unknown";
+                string database;
+                string schema;
+                string table;
+
+                if (parts.Length >= 3)
+                {
+                    database = parts[0];
+                    schema = parts[1];
+                    table = parts[2];
+                }
+                else if (parts.Length == 2)
+                {
+                    database = sourceTable.Database ?? dbcpDatabase ?? string.Empty;
+                    schema = parts[0];
+                    table = parts[1];
+                }
+                else
+                {
+                    database = sourceTable.Database ?? dbcpDatabase ?? string.Empty;
+                    schema = sourceTable.Schema ?? "dbo";
+                    table = parts[0];
+                }
+
+                if (string.IsNullOrWhiteSpace(database))
+                {
+                    _logger.LogWarning("Skipping table-to-processor edge for {Table} — database name could not be determined", table);
+                    continue;
+                }
 
                 // Create source column URN (from table)
                 var sourceColumnFqn = DatabaseFqn.CreateColumn(server, database, schema, table, lineage.SourceColumn);
@@ -965,12 +1005,28 @@ public sealed class NiFiMetadataIngestionService : INiFiMetadataIngestionService
         HttpClient httpClient,
         CancellationToken cancellationToken)
     {
+        var (vendor, _) = await DetermineVendorAndDatabaseFromControllerServiceAsync(
+            controllerServiceId, processorProperties, httpClient, cancellationToken);
+        return vendor;
+    }
+
+    private async Task<(string Vendor, string? Database)> DetermineVendorAndDatabaseFromControllerServiceAsync(
+        string? controllerServiceId,
+        Dictionary<string, string> processorProperties,
+        HttpClient httpClient,
+        CancellationToken cancellationToken)
+    {
         // First try direct properties
         var vendorFromProps = DetermineVendor(processorProperties);
-        if (vendorFromProps != "dbvmssql")
-            return vendorFromProps;
+        string? databaseFromProps = null;
+        var directUrl = processorProperties.GetValueOrDefault("Database Connection URL");
+        if (!string.IsNullOrWhiteSpace(directUrl))
+            databaseFromProps = ParseDatabaseFromJdbcUrl(directUrl);
 
-        // If no direct URL, try fetching the controller service
+        if (vendorFromProps != "dbvmssql" && databaseFromProps != null)
+            return (vendorFromProps, databaseFromProps);
+
+        // Try fetching the controller service for JDBC URL
         if (!string.IsNullOrWhiteSpace(controllerServiceId))
         {
             try
@@ -1007,7 +1063,10 @@ public sealed class NiFiMetadataIngestionService : INiFiMetadataIngestionService
                         if (!string.IsNullOrWhiteSpace(jdbcUrl))
                         {
                             _logger.LogInformation("Controller service {Id} JDBC URL: {Url}", controllerServiceId, jdbcUrl);
-                            return DetermineVendorFromJdbcUrl(jdbcUrl);
+                            var vendor = DetermineVendorFromJdbcUrl(jdbcUrl);
+                            var database = ParseDatabaseFromJdbcUrl(jdbcUrl);
+                            _logger.LogInformation("Parsed from JDBC URL — vendor: {Vendor}, database: {Database}", vendor, database);
+                            return (vendor, database);
                         }
 
                         // Also check type name for Snowflake
@@ -1015,7 +1074,7 @@ public sealed class NiFiMetadataIngestionService : INiFiMetadataIngestionService
                         {
                             var typeName = typeEl.GetString() ?? string.Empty;
                             if (typeName.Contains("Snowflake", StringComparison.OrdinalIgnoreCase))
-                                return "dbvsnowflake";
+                                return ("dbvsnowflake", databaseFromProps);
                         }
                     }
                 }
@@ -1030,7 +1089,7 @@ public sealed class NiFiMetadataIngestionService : INiFiMetadataIngestionService
             }
         }
 
-        return vendorFromProps;
+        return (vendorFromProps, databaseFromProps);
     }
 
     private string DetermineVendorFromJdbcUrl(string jdbcUrl)
@@ -1046,6 +1105,40 @@ public sealed class NiFiMetadataIngestionService : INiFiMetadataIngestionService
         if (jdbcUrl.Contains("snowflake", StringComparison.OrdinalIgnoreCase))
             return "dbvsnowflake";
         return "dbvmssql";
+    }
+
+    /// <summary>
+    /// Extracts the database name from a JDBC URL.
+    /// Handles patterns like:
+    ///   jdbc:sqlserver://host:1433;databaseName=PRODUCTS
+    ///   jdbc:sqlserver://host:1433;database=PRODUCTS
+    ///   jdbc:postgresql://host:5432/PRODUCTS
+    ///   jdbc:mysql://host:3306/PRODUCTS
+    ///   jdbc:snowflake://account.snowflakecomputing.com/?db=PRODUCTS
+    /// </summary>
+    private static string? ParseDatabaseFromJdbcUrl(string jdbcUrl)
+    {
+        if (string.IsNullOrWhiteSpace(jdbcUrl)) return null;
+
+        // SQL Server: databaseName=X or database=X in semicolon-separated params
+        var sqlServerMatch = System.Text.RegularExpressions.Regex.Match(
+            jdbcUrl, @"(?:databaseName|database)=([^;]+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (sqlServerMatch.Success)
+            return sqlServerMatch.Groups[1].Value.Trim();
+
+        // Snowflake: db=X in query string
+        var snowflakeMatch = System.Text.RegularExpressions.Regex.Match(
+            jdbcUrl, @"[?&]db=([^&;]+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (snowflakeMatch.Success)
+            return snowflakeMatch.Groups[1].Value.Trim();
+
+        // PostgreSQL/MySQL: jdbc:type://host:port/database
+        var pathMatch = System.Text.RegularExpressions.Regex.Match(
+            jdbcUrl, @"jdbc:[^:]+://[^/]+/([^?;]+)");
+        if (pathMatch.Success)
+            return pathMatch.Groups[1].Value.Trim();
+
+        return null;
     }
 
     private string DetermineVendor(Dictionary<string, string> properties)
